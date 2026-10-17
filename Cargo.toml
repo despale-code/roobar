@@ -11,7 +11,7 @@ name = "roobar"
 path = "src/main.rs"
 
 [dependencies]
-chickenwm-core = { path = "../chickenwm-core" }
+chickenwm-core = { path = "../chickenwm-core", features = ["egui"] }
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true

@@ -26,7 +26,6 @@ use chickenwm_core::ipc::{
 };
 use chickenwm_core::monitor::enumerate_monitors;
 use parking_lot::Mutex;
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -112,53 +111,6 @@ fn format_local_clock() -> String {
             weekday, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
         )
     }
-}
-
-/// Resolves a CSS `font-family` list to the first installed font file matching one of its names
-/// (e.g. `"DepartureMono Nerd Font Mono"` -> `DepartureMonoNerdFontMono-Regular.otf`).
-fn resolve_font_file(families: &str) -> Option<PathBuf> {
-    let font_dirs = [
-        std::env::var_os("WINDIR").map(|w| PathBuf::from(w).join("Fonts")),
-        std::env::var_os("LOCALAPPDATA")
-            .map(|l| PathBuf::from(l).join("Microsoft").join("Windows").join("Fonts")),
-    ];
-    let files: Vec<PathBuf> = font_dirs
-        .iter()
-        .flatten()
-        .filter_map(|d| std::fs::read_dir(d).ok())
-        .flatten()
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
-        })
-        .collect();
-    let normalize = |s: &str| {
-        s.chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let stem = |p: &PathBuf| {
-        p.file_stem()
-            .and_then(|s| s.to_str())
-            .map(normalize)
-            .unwrap_or_default()
-    };
-    families.split(',').find_map(|family| {
-        let want = normalize(family);
-        if want.is_empty() {
-            return None;
-        }
-        let regular = format!("{want}regular");
-        files
-            .iter()
-            .find(|p| stem(p) == regular)
-            .or_else(|| files.iter().find(|p| stem(p) == want))
-            .cloned()
-    })
 }
 
 /// Rounds `size` to the nearest whole multiple of the font's pixel grid in physical pixels.
@@ -589,29 +541,12 @@ impl RooBarApp {
         self.applied_font_family = Some(families.clone());
         self.nerd_icons = false;
 
-        let mut fonts = egui::FontDefinitions::default();
-        if let Some(path) = resolve_font_file(&families) {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    fonts
-                        .font_data
-                        .insert("bar".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
-                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                        fonts
-                            .families
-                            .entry(family)
-                            .or_default()
-                            .insert(0, "bar".to_owned());
-                    }
-                    self.nerd_icons = path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().contains("nerd"));
-                    info!("roobar font: {}", path.display());
-                }
-                Err(e) => tracing::warn!("Failed to read font {}: {e}", path.display()),
-            }
+        if let Some(path) = chickenwm_core::fonts::apply_egui_font(ctx, &families, true) {
+            self.nerd_icons = path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().contains("nerd"));
+            info!("roobar font: {}", path.display());
         }
-        ctx.set_fonts(fonts);
     }
 
     /// Nerd Font glyph when available, otherwise a plain fallback symbol.
