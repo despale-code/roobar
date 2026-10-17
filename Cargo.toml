@@ -21,3 +21,4 @@ parking_lot.workspace = true
 eframe.workspace = true
 egui.workspace = true
 windows.workspace = true
+raw-window-handle = "0.6"

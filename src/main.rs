@@ -9,6 +9,10 @@
 //!   * Right: `#cpu`, `#memory`, quick actions (`Files`, `Settings`, `Reload`), monitor Hz badge, `#clock`,
 //!     `#power` (Restart / Shut down popup)
 
+// Release builds are windowed apps: no console window when launched from the shell, a
+// hotkey or the launcher. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use eframe::egui;
 use chickenwm_core::bootstrap_config_and_themes;
@@ -173,7 +177,6 @@ struct IslandStyle {
     bg: egui::Color32,
     hover_bg: egui::Color32,
     border: egui::Color32,
-    shadow: egui::Color32,
     radius: f32,
     /// Faux-bold text (`--font-weight: bold`): pixel fonts like DepartureMono ship no bold face.
     bold: bool,
@@ -194,25 +197,12 @@ fn draw_text(
     painter.galley(pos, galley, color);
 }
 
-/// Paints one floating island: soft drop shadow, fill (blended toward `hover_bg` by `hover_t`)
-/// and a hairline border.
+/// Paints one floating island, flat: a solid fill (blended toward `hover_bg` by `hover_t`) and
+/// a hairline border. No shadows or gradients.
 fn paint_island(painter: &egui::Painter, rect: egui::Rect, style: &IslandStyle, hover_t: f32) {
-    let shadow = egui::Shadow {
-        offset: [0, 2],
-        blur: 8,
-        spread: 0,
-        color: style.shadow,
-    };
-    painter.add(shadow.as_shape(rect, style.radius));
-    painter.rect(
-        rect,
-        style.radius,
-        style.bg.lerp_to_gamma(style.hover_bg, hover_t),
-        egui::Stroke::new(1.0_f32, style.border),
-        egui::StrokeKind::Inside,
-    );
+    let fill = style.bg.lerp_to_gamma(style.hover_bg, hover_t);
+    painter.rect(rect, style.radius, fill, egui::Stroke::new(1.0_f32, style.border), egui::StrokeKind::Inside);
 }
-
 /// An island holding a single line of text. Clickable islands fade toward the hover colour.
 #[allow(clippy::too_many_arguments)]
 fn island_label(
@@ -352,73 +342,44 @@ fn paint_logout_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, color
     painter.add(egui::Shape::line(vec![p(0.55, -0.45), p(1.0, 0.0), p(0.55, 0.45)], stroke));
 }
 
-/// Full-screen power overlay: dims the monitor and offers the `PowerAction`s as cards.
+/// Full-screen power overlay: dims the live desktop and offers the `PowerAction`s as cards.
+///
+/// It's a real transparent window (no screenshot). Two details keep it seamless:
+/// - it's 1 px shorter than the monitor, because Windows treats a window covering the exact
+///   monitor as fullscreen and stops compositing its transparent pixels (they turn black);
+/// - it paints nothing until its DWM open/close transition is disabled, so Windows' own
+///   "new window" zoom/fade has nothing to show; the only motion is ours. (It is created
+///   visible: a transparent window that starts hidden can come up opaque black.)
 struct PowerOverlay {
     opened: Instant,
     /// Set once dismissed or an option is picked; the overlay fades out, then runs it.
     closing: Option<(Instant, Option<PowerAction>)>,
-    /// The monitor as it looked when the overlay opened, drawn under the dim layer. A
-    /// transparent window covering the whole monitor gets treated as fullscreen and its
-    /// transparent pixels turn black, so the overlay paints its own backdrop instead.
-    screenshot: Option<egui::TextureHandle>,
+    /// False until the window exists and has its DWM transitions disabled.
+    shown: bool,
 }
 
-/// Grabs `rect` of the desktop (physical pixels) via GDI.
-fn capture_screen(rect: egui::Rect) -> Option<egui::ColorImage> {
-    use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
-        DIB_RGB_COLORS, SRCCOPY,
-    };
-    let (x, y) = (rect.min.x as i32, rect.min.y as i32);
-    let (w, h) = (rect.width() as i32, rect.height() as i32);
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    unsafe {
-        let screen = GetDC(None);
-        let mem = CreateCompatibleDC(screen);
-        let bmp = CreateCompatibleBitmap(screen, w, h);
-        let old = SelectObject(mem, bmp);
-        let copied = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT).is_ok();
-        SelectObject(mem, old);
+const POWER_OVERLAY_TITLE: &str = "ChickenWM Power";
 
-        let mut info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: w,
-                biHeight: -h, // top-down rows
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
+/// Finds the (still hidden) overlay window, disables its DWM open/close animation and returns
+/// whether it was found.
+fn prepare_power_overlay_window() -> bool {
+    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        let Ok(hwnd) = FindWindowW(None, &windows::core::HSTRING::from(POWER_OVERLAY_TITLE)) else {
+            return false;
         };
-        let mut bgra = vec![0u8; (w * h * 4) as usize];
-        let rows = GetDIBits(
-            mem,
-            bmp,
-            0,
-            h as u32,
-            Some(bgra.as_mut_ptr().cast()),
-            &mut info,
-            DIB_RGB_COLORS,
+        if hwnd.0.is_null() {
+            return false;
+        }
+        let disable = windows::Win32::Foundation::BOOL(1);
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_TRANSITIONS_FORCEDISABLED,
+            &disable as *const _ as *const core::ffi::c_void,
+            size_of::<windows::Win32::Foundation::BOOL>() as u32,
         );
-        let _ = DeleteObject(bmp);
-        let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
-        if !copied || rows != h {
-            return None;
-        }
-        for px in bgra.chunks_exact_mut(4) {
-            px.swap(0, 2);
-            px[3] = 255;
-        }
-        Some(egui::ColorImage::from_rgba_unmultiplied(
-            [w as usize, h as usize],
-            &bgra,
-        ))
+        true
     }
 }
 
@@ -430,6 +391,8 @@ struct SharedBarState {
 
 struct RooBarApp {
     shared: Arc<Mutex<SharedBarState>>,
+    /// The bar window.
+    bar_hwnd: Option<isize>,
     /// `--font-family` value last applied, so the font is only reloaded when the CSS changes it.
     applied_font_family: Option<String>,
     /// The loaded font is a Nerd Font, so icon glyphs can be used.
@@ -467,6 +430,7 @@ impl RooBarApp {
             last_sys_poll: Instant::now(),
             last_wm_poll: Instant::now(),
             power_overlay: None,
+            bar_hwnd: None,
             screen_rect,
         }
     }
@@ -548,7 +512,15 @@ impl eframe::App for RooBarApp {
         [0.0, 0.0, 0.0, 0.0]
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.bar_hwnd.is_none() {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(h) = frame.window_handle() {
+                if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    self.bar_hwnd = Some(w.hwnd.get());
+                }
+            }
+        }
         {
             let mut lock = self.shared.lock();
             if lock.egui_ctx.is_none() {
@@ -609,7 +581,6 @@ impl eframe::App for RooBarApp {
         let ws_empty_bg = col("--ws-empty-bg", rgba(0, 0, 0, 0));
         let ws_empty_fg = col("--ws-empty-fg", rgba(43, 29, 20, 115));
         let border_color = col("--border-color", rgba(59, 42, 31, 70));
-        let shadow_color = col("--shadow-color", rgba(30, 20, 12, 60));
         let border_radius = css.var_px("--border-radius", 12.0);
         let pill_radius = css.var_px("--pill-radius", 10.0);
         let font_size = snap_font_size(
@@ -629,11 +600,9 @@ impl eframe::App for RooBarApp {
             bg: island_bg,
             hover_bg: island_bg.lerp_to_gamma(accent_color, 0.55),
             border: border_color,
-            shadow: shadow_color,
             radius: pill_radius,
             bold,
         };
-
         // Window title: cross-fade + ease the island width whenever the text changes.
         let title_text = if snap.active_window_title.is_empty() {
             format!("desktop · workspace {}", snap.active_workspace)
@@ -928,17 +897,10 @@ impl eframe::App for RooBarApp {
                         if power_resp.on_hover_text("Shut down / Restart / Log out").clicked()
                             && self.power_overlay.is_none()
                         {
-                            let screenshot = capture_screen(self.screen_rect).map(|img| {
-                                ctx.load_texture(
-                                    "power-overlay-screenshot",
-                                    img,
-                                    egui::TextureOptions::LINEAR,
-                                )
-                            });
                             self.power_overlay = Some(PowerOverlay {
                                 opened: Instant::now(),
                                 closing: None,
-                                screenshot,
+                                shown: false,
                             });
                         }
 
@@ -1042,13 +1004,17 @@ impl eframe::App for RooBarApp {
                 .closing
                 .map(|(at, _)| at.elapsed().as_secs_f32() / (anim_secs * 0.8))
                 .unwrap_or(0.0);
-            let fade_out = 1.0 - ease(close_t);
+            // Nothing is painted until the window's DWM transition is off, so Windows' own
+            // open animation (if it still plays) has only transparent pixels to animate.
+            let fade_out = (1.0 - ease(close_t)) * if ov.shown { 1.0 } else { 0.0 };
             let dim = ease(open_secs / anim_secs) * fade_out;
             let last_card_done = open_secs >= anim_secs + STAGGER_SECS * 2.0;
             let animating = !last_card_done || ov.closing.is_some();
 
             let builder = egui::ViewportBuilder::default()
-                .with_title("ChickenWM Power")
+                .with_title(POWER_OVERLAY_TITLE)
+                // Created visible: a transparent window that starts hidden can come up opaque black.
+                .with_visible(true)
                 .with_decorations(false)
                 .with_transparent(true)
                 .with_always_on_top()
@@ -1056,9 +1022,9 @@ impl eframe::App for RooBarApp {
                 .with_taskbar(false)
                 .with_active(true)
                 .with_position(self.screen_rect.min)
-                .with_inner_size(self.screen_rect.size());
+                // 1 px short of the monitor so it isn't treated as fullscreen (see PowerOverlay).
+                .with_inner_size(self.screen_rect.size() - egui::vec2(0.0, 1.0));
 
-            let screenshot = ov.screenshot.clone();
             let (picked, dismissed) = ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("power-overlay"),
                 builder,
@@ -1074,17 +1040,7 @@ impl eframe::App for RooBarApp {
                                 egui::Id::new("power-backdrop"),
                                 egui::Sense::click(),
                             );
-                            if let Some(shot) = &screenshot {
-                                ui.painter().image(
-                                    shot.id(),
-                                    full,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            }
+
                             ui.painter().rect_filled(
                                 full,
                                 0.0,
@@ -1125,7 +1081,6 @@ impl eframe::App for RooBarApp {
                                     bg: style.bg.gamma_multiply(appear),
                                     hover_bg: style.hover_bg.gamma_multiply(appear),
                                     border: style.border.gamma_multiply(appear),
-                                    shadow: style.shadow.gamma_multiply(appear),
                                     radius: style.radius,
                                     bold: style.bold,
                                 };
@@ -1171,7 +1126,15 @@ impl eframe::App for RooBarApp {
                 },
             );
 
-            if ov.closing.is_none() {
+            if !ov.shown {
+                // The window now exists (still blank): turn off Windows' transition, then start
+                // our own fade from this moment.
+                if prepare_power_overlay_window() {
+                    ov.shown = true;
+                    ov.opened = Instant::now();
+                }
+                ctx.request_repaint();
+            } else if ov.closing.is_none() {
                 if picked.is_some() || dismissed {
                     ov.closing = Some((Instant::now(), picked));
                 }
