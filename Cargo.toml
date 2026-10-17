@@ -1,0 +1,23 @@
+[package]
+name = "roobar"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Waybar-style top status bar for ChickenWM with live CSS styling and direct workspace synchronization"
+
+[[bin]]
+name = "roobar"
+path = "src/main.rs"
+
+[dependencies]
+chickenwm-core = { path = "../chickenwm-core" }
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+parking_lot.workspace = true
+eframe.workspace = true
+egui.workspace = true
+windows.workspace = true

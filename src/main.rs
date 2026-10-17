@@ -1,0 +1,1334 @@
+//! `roobar` — Waybar-Style Status Bar for ChickenWM
+//! - Directly synchronized with `chickenwm-wm` via `\\.\pipe\chickenwm-bar-ipc` (`NotifyBarState` push)
+//!   and `\\.\pipe\chickenwm-wm-ipc` (`QueryBarState` / `Dispatch(Action::Workspace)`).
+//! - Styled via hot-reloading `~/.config/chickenwm/roobar.css` (`<5ms` `notify` reload).
+//! - Modules:
+//!   * Left: `#custom-launcher`, `#workspaces` (`1..10` with `.active`, `.occupied`, `.empty` states,
+//!     animated pill expansion, click-to-switch, scroll-wheel workspace cycling), `#layout`
+//!   * Center: `#window` (active window process badge & title on current workspace)
+//!   * Right: `#cpu`, `#memory`, quick actions (`Files`, `Settings`, `Reload`), monitor Hz badge, `#clock`,
+//!     `#power` (Restart / Shut down popup)
+
+use anyhow::Result;
+use eframe::egui;
+use chickenwm_core::bootstrap_config_and_themes;
+use chickenwm_core::config::RgbaColor;
+use chickenwm_core::css::{load_css_sheet, spawn_config_watcher, ConfigWatchEvent, CssStyleSheet};
+use chickenwm_core::failsafe::spawn_emergency_failsafe_thread;
+use chickenwm_core::init_tracing;
+use chickenwm_core::ipc::{
+    send_ipc_command_blocking, serve_ipc, Action, BarStateSnapshot, IpcCommand, IpcResponse,
+    PIPE_NAME_BAR, PIPE_NAME_DAEMON, PIPE_NAME_WM,
+};
+use chickenwm_core::monitor::enumerate_monitors;
+use parking_lot::Mutex;
+use std::path::PathBuf;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::info;
+use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
+use windows::Win32::System::SystemInformation::{
+    GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+};
+use windows::Win32::System::Threading::GetSystemTimes;
+
+fn to_color32(c: RgbaColor) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+#[derive(Default)]
+struct CpuTracker {
+    prev_idle: u64,
+    prev_kernel: u64,
+    prev_user: u64,
+    usage_pct: f32,
+}
+
+impl CpuTracker {
+    fn sample(&mut self) -> f32 {
+        unsafe {
+            let mut idle = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok() {
+                let i = ((idle.dwHighDateTime as u64) << 32) | (idle.dwLowDateTime as u64);
+                let k = ((kernel.dwHighDateTime as u64) << 32) | (kernel.dwLowDateTime as u64);
+                let u = ((user.dwHighDateTime as u64) << 32) | (user.dwLowDateTime as u64);
+
+                let di = i.saturating_sub(self.prev_idle);
+                let dk = k.saturating_sub(self.prev_kernel);
+                let du = u.saturating_sub(self.prev_user);
+                self.prev_idle = i;
+                self.prev_kernel = k;
+                self.prev_user = u;
+
+                let total = dk + du;
+                if total > 0 {
+                    let busy = total.saturating_sub(di);
+                    self.usage_pct = ((busy as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as f32;
+                }
+            }
+        }
+        self.usage_pct
+    }
+}
+
+fn query_memory_stats() -> (f32, f32, u32) {
+    unsafe {
+        let mut mem = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+        if GlobalMemoryStatusEx(&mut mem).is_ok() {
+            let total_gb = mem.ullTotalPhys as f32 / (1024.0 * 1024.0 * 1024.0);
+            let avail_gb = mem.ullAvailPhys as f32 / (1024.0 * 1024.0 * 1024.0);
+            let used_gb = (total_gb - avail_gb).max(0.0);
+            return (used_gb, total_gb, mem.dwMemoryLoad);
+        }
+    }
+    (0.0, 0.0, 0)
+}
+
+fn format_local_clock() -> String {
+    unsafe {
+        let st: SYSTEMTIME = GetLocalTime();
+        let weekday = match st.wDayOfWeek {
+            0 => "Sun",
+            1 => "Mon",
+            2 => "Tue",
+            3 => "Wed",
+            4 => "Thu",
+            5 => "Fri",
+            6 => "Sat",
+            _ => "",
+        };
+        format!(
+            "{} {:04}-{:02}-{:02}  {:02}:{:02}:{:02}",
+            weekday, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
+        )
+    }
+}
+
+/// Resolves a CSS `font-family` list to the first installed font file matching one of its names
+/// (e.g. `"DepartureMono Nerd Font Mono"` -> `DepartureMonoNerdFontMono-Regular.otf`).
+fn resolve_font_file(families: &str) -> Option<PathBuf> {
+    let font_dirs = [
+        std::env::var_os("WINDIR").map(|w| PathBuf::from(w).join("Fonts")),
+        std::env::var_os("LOCALAPPDATA")
+            .map(|l| PathBuf::from(l).join("Microsoft").join("Windows").join("Fonts")),
+    ];
+    let files: Vec<PathBuf> = font_dirs
+        .iter()
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("ttf") || e.eq_ignore_ascii_case("otf"))
+        })
+        .collect();
+    let normalize = |s: &str| {
+        s.chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect::<String>()
+            .to_ascii_lowercase()
+    };
+    let stem = |p: &PathBuf| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .map(normalize)
+            .unwrap_or_default()
+    };
+    families.split(',').find_map(|family| {
+        let want = normalize(family);
+        if want.is_empty() {
+            return None;
+        }
+        let regular = format!("{want}regular");
+        files
+            .iter()
+            .find(|p| stem(p) == regular)
+            .or_else(|| files.iter().find(|p| stem(p) == want))
+            .cloned()
+    })
+}
+
+/// Rounds `size` to the nearest whole multiple of the font's pixel grid in physical pixels.
+/// Pixel fonts (DepartureMono: 11px) only render crisply at exact multiples; anything between
+/// gets anti-aliased into blur. `grid <= 0` disables snapping.
+fn snap_font_size(size: f32, grid: f32, pixels_per_point: f32) -> f32 {
+    if grid <= 0.0 {
+        return size;
+    }
+    let multiple = (size * pixels_per_point / grid).round().max(1.0);
+    multiple * grid / pixels_per_point
+}
+
+/// Colours shared by every island in the bar.
+struct IslandStyle {
+    bg: egui::Color32,
+    hover_bg: egui::Color32,
+    border: egui::Color32,
+    shadow: egui::Color32,
+    radius: f32,
+    /// Faux-bold text (`--font-weight: bold`): pixel fonts like DepartureMono ship no bold face.
+    bold: bool,
+}
+
+/// Draws `galley` at `pos`; bold double-strikes it 1px to the right, which reads as a crisp
+/// bold weight on pixel fonts.
+fn draw_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    galley: Arc<egui::Galley>,
+    color: egui::Color32,
+    bold: bool,
+) {
+    if bold {
+        painter.galley(pos + egui::vec2(1.0, 0.0), Arc::clone(&galley), color);
+    }
+    painter.galley(pos, galley, color);
+}
+
+/// Paints one floating island: soft drop shadow, fill (blended toward `hover_bg` by `hover_t`)
+/// and a hairline border.
+fn paint_island(painter: &egui::Painter, rect: egui::Rect, style: &IslandStyle, hover_t: f32) {
+    let shadow = egui::Shadow {
+        offset: [0, 2],
+        blur: 8,
+        spread: 0,
+        color: style.shadow,
+    };
+    painter.add(shadow.as_shape(rect, style.radius));
+    painter.rect(
+        rect,
+        style.radius,
+        style.bg.lerp_to_gamma(style.hover_bg, hover_t),
+        egui::Stroke::new(1.0_f32, style.border),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// An island holding a single line of text. Clickable islands fade toward the hover colour.
+#[allow(clippy::too_many_arguments)]
+fn island_label(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    style: &IslandStyle,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    height: f32,
+    clickable: bool,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    let bold_extra = if style.bold { 1.0 } else { 0.0 };
+    let size = egui::vec2(galley.size().x + bold_extra + 22.0, height);
+    let sense = if clickable {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    let hover_t = ui
+        .ctx()
+        .animate_bool_with_time(id, clickable && resp.hovered(), 0.15);
+    paint_island(ui.painter(), rect, style, hover_t);
+    let pos = rect.center() - (galley.size() + egui::vec2(bold_extra, 0.0)) / 2.0;
+    draw_text(ui.painter(), pos, galley, color, style.bold);
+    resp
+}
+
+/// Launches another ChickenWM executable, preferring the copy next to this one.
+fn spawn_sibling(exe_name: &str) {
+    if let Ok(mut exe) = std::env::current_exe() {
+        exe.set_file_name(exe_name);
+        if Command::new(&exe).spawn().is_ok() {
+            return;
+        }
+    }
+    let _ = Command::new(exe_name).spawn();
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum PowerAction {
+    Shutdown,
+    Restart,
+    LogOut,
+}
+
+impl PowerAction {
+    const ALL: [PowerAction; 3] = [PowerAction::Shutdown, PowerAction::Restart, PowerAction::LogOut];
+
+    fn label(self) -> &'static str {
+        match self {
+            PowerAction::Shutdown => "Shut down",
+            PowerAction::Restart => "Restart",
+            PowerAction::LogOut => "Log out",
+        }
+    }
+}
+
+fn run_power_action(action: PowerAction) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // `/l` rejects a `/t` timeout.
+    let args: &[&str] = match action {
+        PowerAction::Shutdown => &["/s", "/t", "0"],
+        PowerAction::Restart => &["/r", "/t", "0"],
+        PowerAction::LogOut => &["/l"],
+    };
+    if let Err(e) = Command::new("shutdown.exe")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+    {
+        tracing::warn!("shutdown.exe {args:?} failed: {e}");
+    }
+}
+
+/// The IEC power symbol (⏻): a ring open at the top with a bar through the gap. Drawn as
+/// shapes so it doesn't depend on the bar font having the glyph.
+fn paint_power_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new((r * 0.22).max(1.5), color);
+    let gap = 0.75_f32; // radians either side of 12 o'clock
+    let start = -std::f32::consts::FRAC_PI_2 + gap;
+    let sweep = std::f32::consts::TAU - 2.0 * gap;
+    let steps = 32;
+    let ring = (0..=steps)
+        .map(|i| {
+            let a = start + sweep * i as f32 / steps as f32;
+            center + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    painter.add(egui::Shape::line(ring, stroke));
+    painter.line_segment(
+        [center - egui::vec2(0.0, r * 1.15), center - egui::vec2(0.0, r * 0.15)],
+        stroke,
+    );
+}
+
+fn glyph_stroke(r: f32, color: egui::Color32) -> egui::Stroke {
+    egui::Stroke::new((r * 0.22).max(1.5), color)
+}
+
+/// Circular arrow open at the top right, arrowhead at 12 o'clock pointing clockwise.
+fn paint_restart_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, color: egui::Color32) {
+    let start = -std::f32::consts::FRAC_PI_2 + 1.0;
+    let end = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU;
+    let steps = 32;
+    let arc = (0..=steps)
+        .map(|i| {
+            let a = start + (end - start) * i as f32 / steps as f32;
+            center + egui::vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    painter.add(egui::Shape::line(arc, glyph_stroke(r, color)));
+    let tip = center + egui::vec2(0.0, -r);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip + egui::vec2(-r * 0.1, -r * 0.42),
+            tip + egui::vec2(r * 0.48, 0.0),
+            tip + egui::vec2(-r * 0.1, r * 0.42),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// Open door bracket with an arrow leaving through it.
+fn paint_logout_glyph(painter: &egui::Painter, center: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = glyph_stroke(r, color);
+    let p = |x: f32, y: f32| center + egui::vec2(x * r, y * r);
+    painter.add(egui::Shape::line(
+        vec![p(0.05, -1.0), p(-0.9, -1.0), p(-0.9, 1.0), p(0.05, 1.0)],
+        stroke,
+    ));
+    painter.line_segment([p(-0.35, 0.0), p(1.0, 0.0)], stroke);
+    painter.add(egui::Shape::line(vec![p(0.55, -0.45), p(1.0, 0.0), p(0.55, 0.45)], stroke));
+}
+
+/// Full-screen power overlay: dims the monitor and offers the `PowerAction`s as cards.
+struct PowerOverlay {
+    opened: Instant,
+    /// Set once dismissed or an option is picked; the overlay fades out, then runs it.
+    closing: Option<(Instant, Option<PowerAction>)>,
+    /// The monitor as it looked when the overlay opened, drawn under the dim layer. A
+    /// transparent window covering the whole monitor gets treated as fullscreen and its
+    /// transparent pixels turn black, so the overlay paints its own backdrop instead.
+    screenshot: Option<egui::TextureHandle>,
+}
+
+/// Grabs `rect` of the desktop (physical pixels) via GDI.
+fn capture_screen(rect: egui::Rect) -> Option<egui::ColorImage> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+        DIB_RGB_COLORS, SRCCOPY,
+    };
+    let (x, y) = (rect.min.x as i32, rect.min.y as i32);
+    let (w, h) = (rect.width() as i32, rect.height() as i32);
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, bmp);
+        let copied = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY | CAPTUREBLT).is_ok();
+        SelectObject(mem, old);
+
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down rows
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bgra = vec![0u8; (w * h * 4) as usize];
+        let rows = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            Some(bgra.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if !copied || rows != h {
+            return None;
+        }
+        for px in bgra.chunks_exact_mut(4) {
+            px.swap(0, 2);
+            px[3] = 255;
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize],
+            &bgra,
+        ))
+    }
+}
+
+struct SharedBarState {
+    snapshot: BarStateSnapshot,
+    css: CssStyleSheet,
+    egui_ctx: Option<egui::Context>,
+}
+
+struct RooBarApp {
+    shared: Arc<Mutex<SharedBarState>>,
+    /// `--font-family` value last applied, so the font is only reloaded when the CSS changes it.
+    applied_font_family: Option<String>,
+    /// The loaded font is a Nerd Font, so icon glyphs can be used.
+    nerd_icons: bool,
+    last_title: String,
+    title_changed: Instant,
+    cpu_tracker: CpuTracker,
+    mem_used_gb: f32,
+    mem_total_gb: f32,
+    mem_pct: u32,
+    clock_text: String,
+    last_sys_poll: Instant,
+    last_wm_poll: Instant,
+    power_overlay: Option<PowerOverlay>,
+    /// Monitor the bar lives on, in the same units the viewports are positioned in.
+    screen_rect: egui::Rect,
+}
+
+impl RooBarApp {
+    fn new(shared: Arc<Mutex<SharedBarState>>, screen_rect: egui::Rect) -> Self {
+        let mut cpu_tracker = CpuTracker::default();
+        let _ = cpu_tracker.sample();
+        let (mem_used_gb, mem_total_gb, mem_pct) = query_memory_stats();
+        Self {
+            shared,
+            applied_font_family: None,
+            nerd_icons: false,
+            last_title: String::new(),
+            title_changed: Instant::now(),
+            cpu_tracker,
+            mem_used_gb,
+            mem_total_gb,
+            mem_pct,
+            clock_text: format_local_clock(),
+            last_sys_poll: Instant::now(),
+            last_wm_poll: Instant::now(),
+            power_overlay: None,
+            screen_rect,
+        }
+    }
+
+    /// Loads the font named by `--font-family` (first installed match) as the bar's font.
+    fn apply_font(&mut self, ctx: &egui::Context, css: &CssStyleSheet) {
+        let families = css
+            .custom_properties
+            .get("--font-family")
+            .cloned()
+            .unwrap_or_default();
+        if self.applied_font_family.as_deref() == Some(families.as_str()) {
+            return;
+        }
+        self.applied_font_family = Some(families.clone());
+        self.nerd_icons = false;
+
+        let mut fonts = egui::FontDefinitions::default();
+        if let Some(path) = resolve_font_file(&families) {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    fonts
+                        .font_data
+                        .insert("bar".to_owned(), Arc::new(egui::FontData::from_owned(bytes)));
+                    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                        fonts
+                            .families
+                            .entry(family)
+                            .or_default()
+                            .insert(0, "bar".to_owned());
+                    }
+                    self.nerd_icons = path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().to_ascii_lowercase().contains("nerd"));
+                    info!("roobar font: {}", path.display());
+                }
+                Err(e) => tracing::warn!("Failed to read font {}: {e}", path.display()),
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+
+    /// Nerd Font glyph when available, otherwise a plain fallback symbol.
+    fn icon(&self, nerd: &str, fallback: &str) -> String {
+        if self.nerd_icons { nerd } else { fallback }.to_owned()
+    }
+
+    fn dispatch_wm_action(&self, action: Action) {
+        // Optimistic immediate UI update for workspace switching so the indicator responds in 0ms
+        if let Action::Workspace(target_ws) = action {
+            let target_ws = target_ws.clamp(1, 10);
+            let mut lock = self.shared.lock();
+            lock.snapshot.active_workspace = target_ws;
+            for ws in &mut lock.snapshot.workspaces {
+                ws.active = ws.id == target_ws;
+            }
+        } else if let Action::WorkspaceRelative(delta) = action {
+            let mut lock = self.shared.lock();
+            let cur = lock.snapshot.active_workspace as i32;
+            let next = ((cur - 1 + delta).rem_euclid(10) + 1) as u32;
+            lock.snapshot.active_workspace = next;
+            for ws in &mut lock.snapshot.workspaces {
+                ws.active = ws.id == next;
+            }
+        }
+
+        std::thread::spawn(move || {
+            if send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::Dispatch(action.clone()))
+                .is_err()
+            {
+                let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::Dispatch(action));
+            }
+        });
+    }
+}
+
+impl eframe::App for RooBarApp {
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        {
+            let mut lock = self.shared.lock();
+            if lock.egui_ctx.is_none() {
+                lock.egui_ctx = Some(ctx.clone());
+            }
+        }
+
+        // Poll system telemetry & clock once per second
+        if self.last_sys_poll.elapsed() >= Duration::from_millis(950) {
+            self.last_sys_poll = Instant::now();
+            self.cpu_tracker.sample();
+            let (u, t, p) = query_memory_stats();
+            self.mem_used_gb = u;
+            self.mem_total_gb = t;
+            self.mem_pct = p;
+            self.clock_text = format_local_clock();
+        }
+
+        // Periodic fallback sync with `chickenwm-wm` (in addition to instant push over `PIPE_NAME_BAR`)
+        if self.last_wm_poll.elapsed() >= Duration::from_millis(300) {
+            self.last_wm_poll = Instant::now();
+            let shared_clone = Arc::clone(&self.shared);
+            std::thread::spawn(move || {
+                if let Ok(IpcResponse::BarState(snap)) =
+                    send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::QueryBarState)
+                {
+                    let mut lock = shared_clone.lock();
+                    if lock.snapshot != snap {
+                        lock.snapshot = snap;
+                        if let Some(ref c) = lock.egui_ctx {
+                            c.request_repaint();
+                        }
+                    }
+                }
+            });
+        }
+
+        let (snap, css) = {
+            let lock = self.shared.lock();
+            (lock.snapshot.clone(), lock.css.clone())
+        };
+
+        self.apply_font(ctx, &css);
+
+        // Palette from `~/.config/chickenwm/roobar.css` (defaults: sepia islands, dark-brown text).
+        let rgba = |r, g, b, a| RgbaColor { r, g, b, a };
+        let col = |name: &str, fallback: RgbaColor| to_color32(css.var_color(name, fallback));
+        let bar_bg = col("--bar-bg", rgba(0, 0, 0, 0));
+        let island_bg = col("--pill-bg", rgba(240, 230, 211, 242));
+        let fg_color = col("--fg-color", rgba(43, 29, 20, 255));
+        let subtext_color = col("--subtext-color", rgba(107, 85, 69, 255));
+        let accent_color = col("--accent-color", rgba(245, 236, 220, 255));
+        let accent_secondary = col("--accent-secondary", rgba(138, 106, 80, 255));
+        let ws_active_bg = col("--ws-active-bg", rgba(59, 42, 31, 255));
+        let ws_active_fg = col("--ws-active-fg", rgba(245, 236, 220, 255));
+        let ws_occupied_bg = col("--ws-occupied-bg", rgba(59, 42, 31, 36));
+        let ws_occupied_fg = col("--ws-occupied-fg", rgba(43, 29, 20, 255));
+        let ws_empty_bg = col("--ws-empty-bg", rgba(0, 0, 0, 0));
+        let ws_empty_fg = col("--ws-empty-fg", rgba(43, 29, 20, 115));
+        let border_color = col("--border-color", rgba(59, 42, 31, 70));
+        let shadow_color = col("--shadow-color", rgba(30, 20, 12, 60));
+        let border_radius = css.var_px("--border-radius", 12.0);
+        let pill_radius = css.var_px("--pill-radius", 10.0);
+        let font_size = snap_font_size(
+            css.var_px("--font-size", 22.0),
+            css.var_px("--font-pixel-grid", 0.0),
+            ctx.pixels_per_point(),
+        );
+        let bold = css.custom_properties.get("--font-weight").is_some_and(|w| {
+            let w = w.trim();
+            w.eq_ignore_ascii_case("bold") || w.parse::<u32>().is_ok_and(|n| n >= 600)
+        });
+        let island_gap = css.var_px("--island-gap", 8.0);
+        let anim_secs = (css.var_px("--anim-ms", 220.0) / 1000.0).max(0.01);
+        let font = egui::FontId::proportional(font_size);
+
+        let style = IslandStyle {
+            bg: island_bg,
+            hover_bg: island_bg.lerp_to_gamma(accent_color, 0.55),
+            border: border_color,
+            shadow: shadow_color,
+            radius: pill_radius,
+            bold,
+        };
+
+        // Window title: cross-fade + ease the island width whenever the text changes.
+        let title_text = if snap.active_window_title.is_empty() {
+            format!("desktop · workspace {}", snap.active_workspace)
+        } else {
+            let title: String = snap.active_window_title.chars().take(64).collect();
+            let process = snap
+                .active_window_process
+                .trim_end_matches(".exe")
+                .trim_end_matches(".EXE");
+            if process.is_empty() {
+                title
+            } else {
+                format!("{process} · {title}")
+            }
+        };
+        if title_text != self.last_title {
+            self.last_title = title_text.clone();
+            self.title_changed = Instant::now();
+        }
+        let title_fade = (self.title_changed.elapsed().as_secs_f32() / anim_secs).clamp(0.0, 1.0);
+        if title_fade < 1.0 {
+            ctx.request_repaint();
+        }
+
+        let bar_frame = egui::Frame::NONE
+            .fill(bar_bg)
+            .stroke(if bar_bg.a() > 0 {
+                egui::Stroke::new(1.0_f32, border_color)
+            } else {
+                egui::Stroke::NONE
+            })
+            .corner_radius(border_radius)
+            // Room around the islands for their drop shadows.
+            .inner_margin(egui::Margin::symmetric(6, 5));
+
+        egui::CentralPanel::default()
+            .frame(bar_frame)
+            .show(ctx, |ui| {
+                let island_h = ui.available_height();
+                ui.columns(3, |cols| {
+                    // =========================================================================
+                    // LEFT: launcher · workspaces · layout
+                    // =========================================================================
+                    cols[0].horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = island_gap;
+
+                        let launcher_text = format!("{} chickenwm", self.icon("\u{f17a}", "❖"));
+                        if island_label(
+                            ui,
+                            egui::Id::new("island-launcher"),
+                            &style,
+                            &launcher_text,
+                            font.clone(),
+                            fg_color,
+                            island_h,
+                            true,
+                        )
+                        .on_hover_text("Summon ChickenWM Launcher (Super + D)")
+                        .clicked()
+                        {
+                            std::thread::spawn(|| {
+                                let _ = send_ipc_command_blocking(
+                                    PIPE_NAME_DAEMON,
+                                    &IpcCommand::SummonLauncher,
+                                );
+                            });
+                        }
+
+                        // #workspaces island with a sliding active highlight. Only workspaces
+                        // with windows (plus the active one) are shown; the rest collapse to
+                        // zero width and fade out, so the island grows/shrinks smoothly.
+                        let pill_h = (island_h - 8.0).max(14.0);
+                        let pill_gap = 3.0;
+                        let inner_pad = 4.0;
+                        // Sized from the font so two-digit labels ("10") always fit.
+                        let digit = font_size * 0.6;
+                        let active_w = digit * 2.0 + 28.0;
+                        let occupied_w = digit * 2.0 + 16.0;
+                        let mut widths = [0.0_f32; 10];
+                        let mut visibility = [0.0_f32; 10];
+                        for idx in 0..10 {
+                            let ws_id = (idx + 1) as u32;
+                            let occupied = snap.workspaces.get(idx).is_some_and(|w| w.occupied);
+                            let active = snap.active_workspace == ws_id;
+                            let full = if active { active_w } else { occupied_w };
+                            let target = if active || occupied { full } else { 0.0 };
+                            widths[idx] = ctx.animate_value_with_time(
+                                egui::Id::new(("ws-width", idx)),
+                                target,
+                                anim_secs,
+                            );
+                            visibility[idx] = (widths[idx] / full).clamp(0.0, 1.0);
+                        }
+                        let gaps: f32 = visibility.iter().map(|v| v * pill_gap).sum();
+                        let total_w = widths.iter().sum::<f32>() + (gaps - pill_gap).max(0.0)
+                            + inner_pad * 2.0;
+                        let (ws_rect, ws_resp) = ui.allocate_exact_size(
+                            egui::vec2(total_w, island_h),
+                            egui::Sense::hover(),
+                        );
+                        paint_island(ui.painter(), ws_rect, &style, 0.0);
+
+                        let mut pills = [egui::Rect::NOTHING; 10];
+                        let mut x = ws_rect.left() + inner_pad;
+                        for (idx, pill) in pills.iter_mut().enumerate() {
+                            *pill = egui::Rect::from_min_size(
+                                egui::pos2(x, ws_rect.center().y - pill_h / 2.0),
+                                egui::vec2(widths[idx], pill_h),
+                            );
+                            x += widths[idx] + pill_gap * visibility[idx];
+                        }
+                        let pill_r = (pill_radius - 3.0).max(2.0);
+                        let active_idx = (snap.active_workspace.clamp(1, 10) - 1) as usize;
+                        let target = pills[active_idx];
+                        let hl_x = ctx.animate_value_with_time(
+                            egui::Id::new("ws-highlight-x"),
+                            target.left(),
+                            anim_secs,
+                        );
+                        let hl_w = ctx.animate_value_with_time(
+                            egui::Id::new("ws-highlight-w"),
+                            target.width(),
+                            anim_secs,
+                        );
+                        let highlight = egui::Rect::from_min_size(
+                            egui::pos2(hl_x, target.top()),
+                            egui::vec2(hl_w, pill_h),
+                        );
+
+                        for (idx, pill) in pills.iter().enumerate() {
+                            if pill.width() < 1.0 {
+                                continue;
+                            }
+                            let ws_id = (idx + 1) as u32;
+                            let info = snap.workspaces.get(idx);
+                            let occupied = info.is_some_and(|w| w.occupied);
+                            let active = idx == active_idx;
+                            let resp = ui.interact(
+                                *pill,
+                                egui::Id::new(("ws-pill", idx)),
+                                egui::Sense::click(),
+                            );
+                            let hover_t = ctx.animate_bool_with_time(
+                                egui::Id::new(("ws-hover", idx)),
+                                resp.hovered() && !active,
+                                0.15,
+                            );
+                            let base = if occupied { ws_occupied_bg } else { ws_empty_bg };
+                            ui.painter().rect_filled(*pill, pill_r, base);
+                            if hover_t > 0.0 {
+                                ui.painter().rect_filled(
+                                    *pill,
+                                    pill_r,
+                                    ws_active_bg.gamma_multiply(0.22 * hover_t),
+                                );
+                            }
+
+                            let client_count = info.map(|w| w.client_count).unwrap_or(0);
+                            let hover_title = info
+                                .and_then(|w| w.focused_title.as_deref())
+                                .unwrap_or("empty");
+                            let resp = resp.on_hover_text(format!(
+                                "Workspace {} ({} window{}) — {}\nClick to switch • Scroll to cycle",
+                                ws_id,
+                                client_count,
+                                if client_count == 1 { "" } else { "s" },
+                                hover_title
+                            ));
+                            if resp.clicked() {
+                                self.dispatch_wm_action(Action::Workspace(ws_id));
+                            }
+                        }
+
+                        ui.painter().rect_filled(highlight, pill_r, ws_active_bg);
+
+                        for (idx, pill) in pills.iter().enumerate() {
+                            if pill.width() < 1.0 {
+                                continue;
+                            }
+                            let occupied = snap.workspaces.get(idx).is_some_and(|w| w.occupied);
+                            // Text flips to the highlight's colour while the highlight covers it.
+                            let covered = highlight.contains(pill.center());
+                            let fg = if covered {
+                                ws_active_fg
+                            } else if occupied {
+                                ws_occupied_fg
+                            } else {
+                                ws_empty_fg
+                            }
+                            .gamma_multiply(visibility[idx]);
+                            let number =
+                                ui.painter()
+                                    .layout_no_wrap(format!("{}", idx + 1), font.clone(), fg);
+                            // Whole-pixel position keeps the pixel font crisp; clip while the
+                            // pill is still growing or collapsing.
+                            let pos = (pill.center() - number.size() / 2.0).round();
+                            draw_text(&ui.painter_at(*pill), pos, number, fg, bold);
+                            if occupied && !covered {
+                                ui.painter().circle_filled(
+                                    egui::pos2(pill.center().x, pill.bottom() - 2.5),
+                                    1.5,
+                                    fg,
+                                );
+                            }
+                        }
+
+                        if ws_resp.hovered() {
+                            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+                            if scroll_y > 4.0 {
+                                self.dispatch_wm_action(Action::WorkspaceRelative(-1));
+                            } else if scroll_y < -4.0 {
+                                self.dispatch_wm_action(Action::WorkspaceRelative(1));
+                            }
+                        }
+
+                        let is_master = snap.active_layout.eq_ignore_ascii_case("master");
+                        let layout_text = if is_master {
+                            format!("{} master", self.icon("\u{f009}", "⊞"))
+                        } else {
+                            format!("{} dwindle", self.icon("\u{f0db}", "◫"))
+                        };
+                        if island_label(
+                            ui,
+                            egui::Id::new("island-layout"),
+                            &style,
+                            &layout_text,
+                            font.clone(),
+                            accent_secondary,
+                            island_h,
+                            true,
+                        )
+                        .on_hover_text("Click to toggle layout (Dwindle <-> Master)")
+                        .clicked()
+                        {
+                            let next = if is_master { "dwindle" } else { "master" };
+                            self.dispatch_wm_action(Action::SetLayout(next.to_string()));
+                        }
+                    });
+
+                    // =========================================================================
+                    // CENTER: focused window title
+                    // =========================================================================
+                    cols[1].vertical_centered(|ui| {
+                        let text = format!("{}  {}", self.icon("\u{f2d0}", "▣"), title_text);
+                        let galley = ui.painter().layout_no_wrap(text, font.clone(), fg_color);
+                        let target_w = (galley.size().x + 24.0).min(ui.available_width());
+                        let width = ctx.animate_value_with_time(
+                            egui::Id::new("island-title-w"),
+                            target_w,
+                            anim_secs,
+                        );
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, island_h),
+                            egui::Sense::hover(),
+                        );
+                        paint_island(ui.painter(), rect, &style, 0.0);
+                        let pos = egui::pos2(
+                            rect.center().x - galley.size().x / 2.0,
+                            rect.center().y - galley.size().y / 2.0 + (1.0 - title_fade) * 4.0,
+                        );
+                        draw_text(
+                            &ui.painter_at(rect.shrink(4.0)),
+                            pos,
+                            galley,
+                            fg_color.gamma_multiply(title_fade),
+                            bold,
+                        );
+                    });
+
+                    // =========================================================================
+                    // RIGHT: power · clock · actions · refresh rate · cpu/ram
+                    // =========================================================================
+                    cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = island_gap;
+
+                        let (power_rect, power_resp) = ui.allocate_exact_size(
+                            egui::vec2(island_h + 6.0, island_h),
+                            egui::Sense::click(),
+                        );
+                        let hover_t = ctx.animate_bool_with_time(
+                            egui::Id::new("island-power"),
+                            power_resp.hovered() || self.power_overlay.is_some(),
+                            0.15,
+                        );
+                        paint_island(ui.painter(), power_rect, &style, hover_t);
+                        paint_power_glyph(
+                            ui.painter(),
+                            power_rect.center(),
+                            island_h * 0.24,
+                            fg_color,
+                        );
+                        if power_resp.on_hover_text("Shut down / Restart / Log out").clicked()
+                            && self.power_overlay.is_none()
+                        {
+                            let screenshot = capture_screen(self.screen_rect).map(|img| {
+                                ctx.load_texture(
+                                    "power-overlay-screenshot",
+                                    img,
+                                    egui::TextureOptions::LINEAR,
+                                )
+                            });
+                            self.power_overlay = Some(PowerOverlay {
+                                opened: Instant::now(),
+                                closing: None,
+                                screenshot,
+                            });
+                        }
+
+                        let clock = format!("{} {}", self.icon("\u{f017}", "◷"), self.clock_text);
+                        island_label(
+                            ui,
+                            egui::Id::new("island-clock"),
+                            &style,
+                            &clock,
+                            font.clone(),
+                            fg_color,
+                            island_h,
+                            false,
+                        );
+
+                        let settings_icon = self.icon("\u{f013}", "⚙");
+                        if island_label(
+                            ui,
+                            egui::Id::new("island-settings"),
+                            &style,
+                            &settings_icon,
+                            font.clone(),
+                            fg_color,
+                            island_h,
+                            true,
+                        )
+                        .on_hover_text("Open ChickenWM Settings (Super + I)")
+                        .clicked()
+                        {
+                            spawn_sibling("chickenwm-settings.exe");
+                        }
+
+                        let files_icon = self.icon("\u{f07b}", "📁");
+                        if island_label(
+                            ui,
+                            egui::Id::new("island-files"),
+                            &style,
+                            &files_icon,
+                            font.clone(),
+                            fg_color,
+                            island_h,
+                            true,
+                        )
+                        .on_hover_text("Open ChickenWM File Explorer (Super + E)")
+                        .clicked()
+                        {
+                            spawn_sibling("chickenwm-files.exe");
+                        }
+
+                        let hz = if snap.dwm_hook_active {
+                            format!("{}Hz · udwm", snap.monitor_refresh_hz)
+                        } else {
+                            format!("{}Hz", snap.monitor_refresh_hz)
+                        };
+                        let hz = format!("{} {}", self.icon("\u{f0e4}", "◔"), hz);
+                        island_label(
+                            ui,
+                            egui::Id::new("island-hz"),
+                            &style,
+                            &hz,
+                            font.clone(),
+                            subtext_color,
+                            island_h,
+                            false,
+                        );
+
+                        let stats = format!(
+                            "{} {:>2.0}%  {} {:.1}G",
+                            self.icon("\u{f2db}", "cpu"),
+                            self.cpu_tracker.usage_pct,
+                            self.icon("\u{f233}", "ram"),
+                            self.mem_used_gb
+                        );
+                        island_label(
+                            ui,
+                            egui::Id::new("island-stats"),
+                            &style,
+                            &stats,
+                            font.clone(),
+                            fg_color,
+                            island_h,
+                            false,
+                        )
+                        .on_hover_text(format!(
+                            "RAM {:.1} / {:.1} GB ({}%)",
+                            self.mem_used_gb, self.mem_total_gb, self.mem_pct
+                        ));
+                    });
+                });
+            });
+
+        // Power overlay: a transparent full-monitor window that dims the screen and shows the
+        // options as cards. Closes on Esc, a click on the dimmed area, or a pick (fade out first).
+        if let Some(ov) = self.power_overlay.as_mut() {
+            const CARD: f32 = 64.0;
+            const CARD_GAP: f32 = 24.0;
+            const STAGGER_SECS: f32 = 0.06;
+            let ease = |t: f32| 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
+            let open_secs = ov.opened.elapsed().as_secs_f32();
+            let close_t = ov
+                .closing
+                .map(|(at, _)| at.elapsed().as_secs_f32() / (anim_secs * 0.8))
+                .unwrap_or(0.0);
+            let fade_out = 1.0 - ease(close_t);
+            let dim = ease(open_secs / anim_secs) * fade_out;
+            let last_card_done = open_secs >= anim_secs + STAGGER_SECS * 2.0;
+            let animating = !last_card_done || ov.closing.is_some();
+
+            let builder = egui::ViewportBuilder::default()
+                .with_title("ChickenWM Power")
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_always_on_top()
+                .with_resizable(false)
+                .with_taskbar(false)
+                .with_active(true)
+                .with_position(self.screen_rect.min)
+                .with_inner_size(self.screen_rect.size());
+
+            let screenshot = ov.screenshot.clone();
+            let (picked, dismissed) = ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("power-overlay"),
+                builder,
+                |octx, _class| {
+                    let mut picked = None;
+                    let mut dismissed = false;
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(octx, |ui| {
+                            let full = ui.max_rect();
+                            let backdrop = ui.interact(
+                                full,
+                                egui::Id::new("power-backdrop"),
+                                egui::Sense::click(),
+                            );
+                            if let Some(shot) = &screenshot {
+                                ui.painter().image(
+                                    shot.id(),
+                                    full,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            ui.painter().rect_filled(
+                                full,
+                                0.0,
+                                egui::Color32::from_black_alpha((160.0 * dim) as u8),
+                            );
+
+                            let row_w = CARD * 3.0 + CARD_GAP * 2.0;
+                            let origin = full.center() - egui::vec2(row_w / 2.0, CARD / 2.0);
+                            for (i, action) in PowerAction::ALL.into_iter().enumerate() {
+                                // Cards rise into place one after another.
+                                let appear = ease(
+                                    (open_secs - i as f32 * STAGGER_SECS) / anim_secs,
+                                ) * fade_out;
+                                let slot = egui::Rect::from_min_size(
+                                    origin
+                                        + egui::vec2(
+                                            i as f32 * (CARD + CARD_GAP),
+                                            (1.0 - appear) * 24.0,
+                                        ),
+                                    egui::vec2(CARD, CARD),
+                                );
+                                let resp = ui.interact(
+                                    slot,
+                                    egui::Id::new(("power-card", i)),
+                                    egui::Sense::click(),
+                                );
+                                let hover_t = octx.animate_bool_with_time(
+                                    egui::Id::new(("power-card-hover", i)),
+                                    resp.hovered(),
+                                    0.15,
+                                );
+                                // Hover lifts the card and grows it slightly.
+                                let rect = egui::Rect::from_center_size(
+                                    slot.center() - egui::vec2(0.0, 4.0 * hover_t),
+                                    egui::vec2(CARD, CARD) * (1.0 + 0.08 * hover_t),
+                                );
+                                let card_style = IslandStyle {
+                                    bg: style.bg.gamma_multiply(appear),
+                                    hover_bg: style.hover_bg.gamma_multiply(appear),
+                                    border: style.border.gamma_multiply(appear),
+                                    shadow: style.shadow.gamma_multiply(appear),
+                                    radius: style.radius,
+                                    bold: style.bold,
+                                };
+                                let painter = ui.painter();
+                                paint_island(painter, rect, &card_style, hover_t);
+                                let glyph = fg_color.gamma_multiply(appear);
+                                let r = rect.width() * 0.22;
+                                match action {
+                                    PowerAction::Shutdown => {
+                                        paint_power_glyph(painter, rect.center(), r, glyph)
+                                    }
+                                    PowerAction::Restart => {
+                                        paint_restart_glyph(painter, rect.center(), r, glyph)
+                                    }
+                                    PowerAction::LogOut => {
+                                        paint_logout_glyph(painter, rect.center(), r, glyph)
+                                    }
+                                }
+                                painter.text(
+                                    egui::pos2(slot.center().x, slot.bottom() + 12.0),
+                                    egui::Align2::CENTER_TOP,
+                                    action.label(),
+                                    font.clone(),
+                                    style.bg.gamma_multiply(appear),
+                                );
+                                if resp.clicked() {
+                                    picked = Some(action);
+                                }
+                            }
+                            if backdrop.clicked() && picked.is_none() {
+                                dismissed = true;
+                            }
+                        });
+                    if octx.input(|i| {
+                        i.key_pressed(egui::Key::Escape) || i.viewport().close_requested()
+                    }) {
+                        dismissed = true;
+                    }
+                    if animating {
+                        octx.request_repaint();
+                    }
+                    (picked, dismissed)
+                },
+            );
+
+            if ov.closing.is_none() {
+                if picked.is_some() || dismissed {
+                    ov.closing = Some((Instant::now(), picked));
+                }
+            } else if close_t >= 1.0 {
+                let action = ov.closing.and_then(|(_, a)| a);
+                self.power_overlay = None;
+                if let Some(action) = action {
+                    run_power_action(action);
+                }
+            }
+        }
+
+        // egui keeps repainting while any animate_* value is moving; this covers the clock/stats.
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    init_tracing("roobar");
+    let _failsafe = spawn_emergency_failsafe_thread();
+    let _ = bootstrap_config_and_themes();
+
+    let css = load_css_sheet("roobar.css").unwrap_or_default();
+    let bar_height = css.var_px("--bar-height", 36.0);
+    let margin_top = css.var_px("--bar-margin-top", 6.0);
+    let margin_x = css.var_px("--bar-margin-x", 10.0);
+
+    // Fetch initial workspace state from `chickenwm-wm` if running
+    let initial_snapshot = match send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::QueryBarState)
+    {
+        Ok(IpcResponse::BarState(snap)) => snap,
+        _ => BarStateSnapshot::default(),
+    };
+
+    let shared = Arc::new(Mutex::new(SharedBarState {
+        snapshot: initial_snapshot,
+        css,
+        egui_ctx: None,
+    }));
+
+    // Watch `~/.config/chickenwm/roobar.css` for <5ms live hot-reload
+    let shared_css = Arc::clone(&shared);
+    let _watcher = spawn_config_watcher(move |ev| {
+        if let ConfigWatchEvent::CssChanged { file_name, .. } = ev {
+            if file_name.eq_ignore_ascii_case("roobar.css") {
+                if let Ok(new_sheet) = load_css_sheet("roobar.css") {
+                    let lock = shared_css.lock();
+                    let ctx_opt = lock.egui_ctx.clone();
+                    drop(lock);
+                    shared_css.lock().css = new_sheet;
+                    if let Some(c) = ctx_opt {
+                        c.request_repaint();
+                    }
+                }
+            }
+        }
+    });
+
+    // Spawn direct IPC server on `\\.\pipe\chickenwm-bar-ipc` (`PIPE_NAME_BAR`)
+    // so `chickenwm-wm` pushes workspace switches in <1ms!
+    let shared_ipc = Arc::clone(&shared);
+    tokio::spawn(async move {
+        let _ = serve_ipc(PIPE_NAME_BAR, move |cmd| {
+            let st = Arc::clone(&shared_ipc);
+            async move {
+                match cmd {
+                    IpcCommand::NotifyBarState(snap) => {
+                        let ctx_opt = {
+                            let mut lock = st.lock();
+                            lock.snapshot = snap;
+                            lock.egui_ctx.clone()
+                        };
+                        if let Some(c) = ctx_opt {
+                            c.request_repaint();
+                        }
+                        IpcResponse::Ok {
+                            message: "roobar state updated".to_string(),
+                        }
+                    }
+                    IpcCommand::ReloadConfig => {
+                        if let Ok(new_sheet) = load_css_sheet("roobar.css") {
+                            let ctx_opt = {
+                                let mut lock = st.lock();
+                                lock.css = new_sheet;
+                                lock.egui_ctx.clone()
+                            };
+                            if let Some(c) = ctx_opt {
+                                c.request_repaint();
+                            }
+                        }
+                        IpcResponse::Ok {
+                            message: "roobar.css reloaded".to_string(),
+                        }
+                    }
+                    _ => IpcResponse::Ok {
+                        message: "Ignored by roobar".to_string(),
+                    },
+                }
+            }
+        })
+        .await;
+    });
+
+    let monitors = enumerate_monitors();
+    let mon = monitors
+        .iter()
+        .find(|m| m.is_primary)
+        .or_else(|| monitors.first())
+        .cloned()
+        .unwrap_or(chickenwm_core::ipc::MonitorInfo {
+            id: 0,
+            name: r"\\.\DISPLAY1".to_string(),
+            adapter_name: "Default".to_string(),
+            width: 1920,
+            height: 1080,
+            x: 0,
+            y: 0,
+            work_rect: [0, 0, 1920, 1080],
+            refresh_rate_hz: 60,
+            dpi_scale: 1.0,
+            active_workspace_id: 1,
+            is_primary: true,
+        });
+    let bar_x = (mon.x as f32) + margin_x;
+    let bar_y = (mon.y as f32) + margin_top;
+    let bar_w = ((mon.width as f32) - margin_x * 2.0).max(400.0);
+    let screen_rect = egui::Rect::from_min_size(
+        egui::pos2(mon.x as f32, mon.y as f32),
+        egui::vec2(mon.width as f32, mon.height as f32),
+    );
+
+    info!(
+        "Starting roobar at ({}, {}), size {}x{} on {} ({}Hz)",
+        bar_x, bar_y, bar_w, bar_height, mon.name, mon.refresh_rate_hz
+    );
+
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("ChickenWM Bar — roobar")
+        .with_decorations(false)
+        .with_transparent(true)
+        .with_always_on_top()
+        .with_resizable(false)
+        .with_taskbar(false)
+        .with_position([bar_x, bar_y])
+        .with_inner_size([bar_w, bar_height]);
+
+    let native_options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+
+    let _ = eframe::run_native(
+        "ChickenWM Bar — roobar",
+        native_options,
+        Box::new(move |_cc| Ok(Box::new(RooBarApp::new(shared, screen_rect)))),
+    );
+
+    Ok(())
+}
