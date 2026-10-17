@@ -356,6 +356,147 @@ struct PowerOverlay {
     closing: Option<(Instant, Option<PowerAction>)>,
     /// False until the window exists and has its DWM transitions disabled.
     shown: bool,
+    /// The monitor as it looked when the overlay opened (sharp + blurred). The overlay paints
+    /// this itself instead of relying on window transparency, which a near-fullscreen GL
+    /// window doesn't reliably keep (it came out opaque black).
+    backdrop: Option<Backdrop>,
+}
+
+struct Backdrop {
+    sharp: egui::TextureHandle,
+    blurred: egui::TextureHandle,
+}
+
+/// Copies the screen area `[x, y, w, h]` (physical pixels) into an image.
+fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> Option<egui::ColorImage> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        SRCCOPY,
+    };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, bmp);
+        let copied = BitBlt(mem, 0, 0, w, h, screen, x, y, SRCCOPY).is_ok();
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(mem, bmp, 0, h as u32, Some(buf.as_mut_ptr() as *mut _), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        let _ = DeleteObject(bmp);
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+        if !copied || lines == 0 {
+            return None;
+        }
+        for px in buf.chunks_exact_mut(4) {
+            px.swap(0, 2); // BGRA -> RGBA
+            px[3] = 255;
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &buf))
+    }
+}
+
+/// A small, heavily blurred copy of `img`: averaged down by `factor`, then box-blurred. Drawn
+/// stretched with linear filtering it becomes a smooth frosted backdrop.
+fn blurred_thumbnail(img: &egui::ColorImage, factor: usize) -> egui::ColorImage {
+    let [w, h] = img.size;
+    let (sw, sh) = ((w / factor).max(1), (h / factor).max(1));
+    let mut acc = vec![[0f32; 3]; sw * sh];
+    for sy in 0..sh {
+        for sx in 0..sw {
+            let mut sum = [0u32; 3];
+            let mut n = 0u32;
+            // Sparse sampling inside each block is plenty before the blur passes.
+            for y in (sy * factor..((sy + 1) * factor).min(h)).step_by(2) {
+                for x in (sx * factor..((sx + 1) * factor).min(w)).step_by(2) {
+                    let p = img.pixels[y * w + x];
+                    sum[0] += p.r() as u32;
+                    sum[1] += p.g() as u32;
+                    sum[2] += p.b() as u32;
+                    n += 1;
+                }
+            }
+            let n = n.max(1) as f32;
+            acc[sy * sw + sx] = [sum[0] as f32 / n, sum[1] as f32 / n, sum[2] as f32 / n];
+        }
+    }
+    // Three separable box passes ≈ a gaussian.
+    const R: isize = 2;
+    let mut tmp = acc.clone();
+    for _ in 0..3 {
+        for y in 0..sh {
+            for x in 0..sw {
+                let mut s = [0f32; 3];
+                let mut n = 0f32;
+                for d in -R..=R {
+                    let xx = x as isize + d;
+                    if xx >= 0 && (xx as usize) < sw {
+                        let p = acc[y * sw + xx as usize];
+                        s = [s[0] + p[0], s[1] + p[1], s[2] + p[2]];
+                        n += 1.0;
+                    }
+                }
+                tmp[y * sw + x] = [s[0] / n, s[1] / n, s[2] / n];
+            }
+        }
+        for y in 0..sh {
+            for x in 0..sw {
+                let mut s = [0f32; 3];
+                let mut n = 0f32;
+                for d in -R..=R {
+                    let yy = y as isize + d;
+                    if yy >= 0 && (yy as usize) < sh {
+                        let p = tmp[yy as usize * sw + x];
+                        s = [s[0] + p[0], s[1] + p[1], s[2] + p[2]];
+                        n += 1.0;
+                    }
+                }
+                acc[y * sw + x] = [s[0] / n, s[1] / n, s[2] / n];
+            }
+        }
+    }
+    let pixels = acc
+        .iter()
+        .map(|p| egui::Color32::from_rgb(p[0] as u8, p[1] as u8, p[2] as u8))
+        .collect();
+    egui::ColorImage { size: [sw, sh], pixels }
+}
+
+impl Backdrop {
+    /// Captures the monitor under `rect` (egui points) before the overlay covers it.
+    fn capture(ctx: &egui::Context, rect: egui::Rect) -> Option<Self> {
+        let ppp = ctx.pixels_per_point();
+        let img = capture_screen(
+            (rect.min.x * ppp).round() as i32,
+            (rect.min.y * ppp).round() as i32,
+            (rect.width() * ppp).round() as i32,
+            (rect.height() * ppp).round() as i32,
+        )?;
+        let blurred = blurred_thumbnail(&img, 14);
+        Some(Self {
+            sharp: ctx.load_texture("power-backdrop-sharp", img, egui::TextureOptions::LINEAR),
+            blurred: ctx.load_texture("power-backdrop-blur", blurred, egui::TextureOptions::LINEAR),
+        })
+    }
 }
 
 const POWER_OVERLAY_TITLE: &str = "ChickenWM Power";
@@ -897,10 +1038,13 @@ impl eframe::App for RooBarApp {
                         if power_resp.on_hover_text("Shut down / Restart / Log out").clicked()
                             && self.power_overlay.is_none()
                         {
+                            // Snapshot the monitor now, before the overlay window covers it.
+                            let backdrop = Backdrop::capture(ui.ctx(), self.screen_rect);
                             self.power_overlay = Some(PowerOverlay {
                                 opened: Instant::now(),
                                 closing: None,
                                 shown: false,
+                                backdrop,
                             });
                         }
 
@@ -1041,11 +1185,30 @@ impl eframe::App for RooBarApp {
                                 egui::Sense::click(),
                             );
 
-                            ui.painter().rect_filled(
-                                full,
-                                0.0,
-                                egui::Color32::from_black_alpha((160.0 * dim) as u8),
-                            );
+                            if let Some(bd) = &ov.backdrop {
+                                // The screen as it was (seamless at open/close), cross-fading
+                                // into a dimmed, frosted copy. The window is 1px short of the
+                                // monitor, so crop rather than squash.
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, (full.height() / self.screen_rect.height()).min(1.0)),
+                                );
+                                ui.painter().image(bd.sharp.id(), full, uv, egui::Color32::WHITE);
+                                let v = (150.0 * dim) as u8;
+                                let a = (255.0 * dim) as u8;
+                                ui.painter().image(
+                                    bd.blurred.id(),
+                                    full,
+                                    uv,
+                                    egui::Color32::from_rgba_premultiplied(v, v, v, a),
+                                );
+                            } else {
+                                ui.painter().rect_filled(
+                                    full,
+                                    0.0,
+                                    egui::Color32::from_black_alpha((160.0 * dim) as u8),
+                                );
+                            }
 
                             let row_w = CARD * 3.0 + CARD_GAP * 2.0;
                             let origin = full.center() - egui::vec2(row_w / 2.0, CARD / 2.0);
