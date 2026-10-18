@@ -6,8 +6,9 @@
 //!   * Left: `#custom-launcher`, `#workspaces` (`1..10` with `.active`, `.occupied`, `.empty` states,
 //!     animated pill expansion, click-to-switch, scroll-wheel workspace cycling), `#layout`
 //!   * Center: `#window` (active window process badge & title on current workspace)
-//!   * Right: `#cpu`, `#memory`, quick actions (`Files`, `Settings`, `Reload`), monitor Hz badge, `#clock`,
-//!     `#power` (Restart / Shut down popup)
+//!   * Right: a configurable list from the widget library (`widgets.rs`, `--modules-right` in
+//!     roobar.css): stats, cpu, memory, refresh-rate, network, volume, bluetooth, files, settings,
+//!     clock, power
 
 // Release builds are windowed apps: no console window when launched from the shell, a
 // hotkey or the launcher. Debug builds keep the console for logs.
@@ -30,6 +31,17 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
+
+mod popover;
+mod previews;
+mod procs;
+mod tray;
+mod status;
+mod widgets;
+
+use popover::{Popover, PopoverKind};
+use status::{Cmd, StatusMonitor};
+use widgets::Widget;
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 use windows::Win32::System::SystemInformation::{
     GetLocalTime, GlobalMemoryStatusEx, MEMORYSTATUSEX,
@@ -93,24 +105,9 @@ fn query_memory_stats() -> (f32, f32, u32) {
     (0.0, 0.0, 0)
 }
 
-fn format_local_clock() -> String {
-    unsafe {
-        let st: SYSTEMTIME = GetLocalTime();
-        let weekday = match st.wDayOfWeek {
-            0 => "Sun",
-            1 => "Mon",
-            2 => "Tue",
-            3 => "Wed",
-            4 => "Thu",
-            5 => "Fri",
-            6 => "Sat",
-            _ => "",
-        };
-        format!(
-            "{} {:04}-{:02}-{:02}  {:02}:{:02}:{:02}",
-            weekday, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond
-        )
-    }
+fn format_local_clock(fmt: &str) -> String {
+    let st: SYSTEMTIME = unsafe { GetLocalTime() };
+    widgets::format_clock(fmt, &st)
 }
 
 /// Rounds `size` to the nearest whole multiple of the font's pixel grid in physical pixels.
@@ -132,6 +129,9 @@ struct IslandStyle {
     radius: f32,
     /// Faux-bold text (`--font-weight: bold`): pixel fonts like DepartureMono ship no bold face.
     bold: bool,
+    /// `--islands: false`: the bar has one background and border; islands keep their layout
+    /// but draw only a hover highlight.
+    flat: bool,
 }
 
 /// Draws `galley` at `pos`; bold double-strikes it 1px to the right, which reads as a crisp
@@ -152,9 +152,21 @@ fn draw_text(
 /// Paints one floating island, flat: a solid fill (blended toward `hover_bg` by `hover_t`) and
 /// a hairline border. No shadows or gradients.
 fn paint_island(painter: &egui::Painter, rect: egui::Rect, style: &IslandStyle, hover_t: f32) {
+    if style.flat {
+        paint_hover_highlight(painter, rect, style, hover_t);
+        return;
+    }
     let fill = style.bg.lerp_to_gamma(style.hover_bg, hover_t);
     painter.rect(rect, style.radius, fill, egui::Stroke::new(1.0_f32, style.border), egui::StrokeKind::Inside);
 }
+/// The hover fill of a segment that has no island of its own (in a shared pill, or `flat`).
+fn paint_hover_highlight(painter: &egui::Painter, rect: egui::Rect, style: &IslandStyle, hover_t: f32) {
+    if hover_t > 0.0 {
+        let fill = style.hover_bg.gamma_multiply(hover_t);
+        painter.rect_filled(rect.shrink(3.0), (style.radius - 3.0).max(0.0), fill);
+    }
+}
+
 /// An island holding a single line of text. Clickable islands fade toward the hover colour.
 #[allow(clippy::too_many_arguments)]
 fn island_label(
@@ -167,9 +179,27 @@ fn island_label(
     height: f32,
     clickable: bool,
 ) -> egui::Response {
+    pill_label(ui, id, style, text, font, color, height, clickable, false)
+}
+
+/// `island_label`, or with `in_group` one segment of a shared pill: no island of its own, just a
+/// hover highlight, and tighter padding.
+#[allow(clippy::too_many_arguments)]
+fn pill_label(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    style: &IslandStyle,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    height: f32,
+    clickable: bool,
+    in_group: bool,
+) -> egui::Response {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
     let bold_extra = if style.bold { 1.0 } else { 0.0 };
-    let size = egui::vec2(galley.size().x + bold_extra + 22.0, height);
+    let padding = if in_group { 16.0 } else { 22.0 };
+    let size = egui::vec2(galley.size().x + bold_extra + padding, height);
     let sense = if clickable {
         egui::Sense::click()
     } else {
@@ -179,7 +209,11 @@ fn island_label(
     let hover_t = ui
         .ctx()
         .animate_bool_with_time(id, clickable && resp.hovered(), 0.15);
-    paint_island(ui.painter(), rect, style, hover_t);
+    if in_group {
+        paint_hover_highlight(ui.painter(), rect, style, hover_t);
+    } else {
+        paint_island(ui.painter(), rect, style, hover_t);
+    }
     let pos = rect.center() - (galley.size() + egui::vec2(bold_extra, 0.0)) / 2.0;
     draw_text(ui.painter(), pos, galley, color, style.bold);
     resp
@@ -215,6 +249,69 @@ impl PowerAction {
     }
 }
 
+/// Which built-in gesture handlers a widget should still run this frame: a gesture that has an
+/// override in roobar.css (`--<widget>-on-<gesture>`) runs that instead and reads as false here.
+struct Gestures {
+    click: bool,
+    middle: bool,
+    right: bool,
+    /// Scroll delta for the built-in handler (0 when there is none or it was overridden).
+    scroll: f32,
+}
+
+fn gestures(ui: &egui::Ui, css: &CssStyleSheet, widget: Widget, resp: &egui::Response) -> Gestures {
+    use widgets::Gesture;
+    let take = |happened: bool, g: Gesture| -> bool {
+        if !happened {
+            return false;
+        }
+        match widgets::gesture_override(css, widget, g) {
+            Some(action) => {
+                run_gesture_action(action);
+                false
+            }
+            None => true,
+        }
+    };
+    let click = take(resp.clicked(), Gesture::Click);
+    let middle = take(resp.middle_clicked(), Gesture::Middle);
+    let right = take(resp.secondary_clicked(), Gesture::Right);
+    let raw = if resp.hovered() { ui.input(|i| i.raw_scroll_delta.y) } else { 0.0 };
+    let scroll = if raw.abs() <= 0.5 {
+        0.0
+    } else if take(true, if raw > 0.0 { Gesture::ScrollUp } else { Gesture::ScrollDown }) {
+        raw
+    } else {
+        0.0
+    };
+    Gestures { click, middle, right, scroll }
+}
+
+fn run_gesture_action(action: widgets::GestureAction) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    match action {
+        widgets::GestureAction::None => {}
+        widgets::GestureAction::Open(target) => status::open_uri(&target),
+        widgets::GestureAction::Exec(cmdline) => {
+            // Through cmd so PATH lookup, quoting and arguments behave as typed.
+            if let Err(e) = Command::new("cmd.exe").raw_arg(format!("/C start \"\" {cmdline}")).creation_flags(CREATE_NO_WINDOW).spawn() {
+                tracing::warn!("bar gesture `{cmdline}` failed: {e}");
+            }
+        }
+        widgets::GestureAction::Dispatch(dispatcher, arg) => match Action::parse_dispatcher(&dispatcher, &arg) {
+            Some(action) => {
+                std::thread::spawn(move || {
+                    if send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::Dispatch(action.clone())).is_err() {
+                        let _ = send_ipc_command_blocking(PIPE_NAME_DAEMON, &IpcCommand::Dispatch(action));
+                    }
+                });
+            }
+            None => tracing::warn!("bar gesture: unknown dispatcher `{dispatcher} {arg}`"),
+        },
+    }
+}
+
 fn run_power_action(action: PowerAction) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -230,6 +327,16 @@ fn run_power_action(action: PowerAction) {
         .spawn()
     {
         tracing::warn!("shutdown.exe {args:?} failed: {e}");
+    }
+}
+
+/// Three stacked horizontal bars (☰), drawn as shapes like the power glyph.
+fn paint_menu_glyph(painter: &egui::Painter, center: egui::Pos2, half_w: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6_f32, color);
+    let gap = (half_w * 0.62).round();
+    for dy in [-gap, 0.0, gap] {
+        let y = (center.y + dy).round() + 0.5;
+        painter.line_segment([egui::pos2(center.x - half_w, y), egui::pos2(center.x + half_w, y)], stroke);
     }
 }
 
@@ -314,9 +421,9 @@ struct PowerOverlay {
     backdrop: Option<Backdrop>,
 }
 
-struct Backdrop {
-    sharp: egui::TextureHandle,
-    blurred: egui::TextureHandle,
+pub(crate) struct Backdrop {
+    pub sharp: egui::TextureHandle,
+    pub blurred: egui::TextureHandle,
 }
 
 /// Copies the screen area `[x, y, w, h]` (physical pixels) into an image.
@@ -435,7 +542,7 @@ fn blurred_thumbnail(img: &egui::ColorImage, factor: usize) -> egui::ColorImage 
 
 impl Backdrop {
     /// Captures the monitor under `rect` (egui points) before the overlay covers it.
-    fn capture(ctx: &egui::Context, rect: egui::Rect) -> Option<Self> {
+    pub(crate) fn capture(ctx: &egui::Context, rect: egui::Rect) -> Option<Self> {
         let ppp = ctx.pixels_per_point();
         let img = capture_screen(
             (rect.min.x * ppp).round() as i32,
@@ -453,13 +560,12 @@ impl Backdrop {
 
 const POWER_OVERLAY_TITLE: &str = "ChickenWM Power";
 
-/// Finds the (still hidden) overlay window, disables its DWM open/close animation and returns
-/// whether it was found.
-fn prepare_power_overlay_window() -> bool {
+/// Finds a window by title, disables its DWM open/close animation and returns whether it was found.
+pub(crate) fn prepare_window_no_transitions(title: &str) -> bool {
     use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
     use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
     unsafe {
-        let Ok(hwnd) = FindWindowW(None, &windows::core::HSTRING::from(POWER_OVERLAY_TITLE)) else {
+        let Ok(hwnd) = FindWindowW(None, &windows::core::HSTRING::from(title)) else {
             return false;
         };
         if hwnd.0.is_null() {
@@ -472,8 +578,27 @@ fn prepare_power_overlay_window() -> bool {
             &disable as *const _ as *const core::ffi::c_void,
             size_of::<windows::Win32::Foundation::BOOL>() as u32,
         );
+        // No Windows 11 frame line or system rounding: the window draws its own card edge.
+        let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_BORDER_COLOR,
+            &no_border as *const _ as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+        let no_round = windows::Win32::Graphics::Dwm::DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            windows::Win32::Graphics::Dwm::DWMWA_WINDOW_CORNER_PREFERENCE,
+            &no_round as *const _ as *const core::ffi::c_void,
+            size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
         true
     }
+}
+
+fn prepare_power_overlay_window() -> bool {
+    prepare_window_no_transitions(POWER_OVERLAY_TITLE)
 }
 
 struct SharedBarState {
@@ -496,10 +621,30 @@ struct RooBarApp {
     mem_used_gb: f32,
     mem_total_gb: f32,
     mem_pct: u32,
-    clock_text: String,
+    /// Network, volume and Bluetooth, polled on a background thread.
+    status: StatusMonitor,
     last_sys_poll: Instant,
     last_wm_poll: Instant,
     power_overlay: Option<PowerOverlay>,
+    /// A hamburger-menu pick waiting for the menu to finish closing.
+    pending_menu: Option<popover::MenuAction>,
+    /// Calendar / volume / processes / media / network drop-down.
+    popover: Option<Popover>,
+    /// The popover that last closed and when: clicking its widget closes it (the click takes
+    /// focus first), and must not reopen it straight away.
+    popover_closed: Option<(PopoverKind, Instant)>,
+    /// Tray icon textures by icon handle.
+    tray_textures: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
+    /// User-defined tray icon order (`(hwnd, uid)`).
+    tray_order: Vec<(u64, u32)>,
+    /// User-hidden tray icons (`(hwnd, uid)`), shown dimmed only when the tray is expanded.
+    tray_hidden: std::collections::HashSet<(u64, u32)>,
+    /// Currently dragged tray icon (`(hwnd, uid)`).
+    tray_dragging: Option<(u64, u32)>,
+    /// The tray shows every icon (the overflow chevron was clicked).
+    tray_expanded: bool,
+    /// Live window thumbnails when hovering a workspace pill.
+    previews: previews::Previews,
     /// Monitor the bar lives on, in the same units the viewports are positioned in.
     screen_rect: egui::Rect,
 }
@@ -509,6 +654,12 @@ impl RooBarApp {
         let mut cpu_tracker = CpuTracker::default();
         let _ = cpu_tracker.sample();
         let (mem_used_gb, mem_total_gb, mem_pct) = query_memory_stats();
+        let repaint = Arc::clone(&shared);
+        let status = StatusMonitor::spawn(move || {
+            if let Some(ctx) = repaint.lock().egui_ctx.as_ref() {
+                ctx.request_repaint();
+            }
+        });
         Self {
             shared,
             applied_font_family: None,
@@ -519,10 +670,19 @@ impl RooBarApp {
             mem_used_gb,
             mem_total_gb,
             mem_pct,
-            clock_text: format_local_clock(),
+            status,
             last_sys_poll: Instant::now(),
             last_wm_poll: Instant::now(),
             power_overlay: None,
+            pending_menu: None,
+            popover: None,
+            popover_closed: None,
+            tray_textures: Default::default(),
+            tray_order: Vec::new(),
+            tray_hidden: Default::default(),
+            tray_dragging: None,
+            tray_expanded: false,
+            previews: Default::default(),
             bar_hwnd: None,
             screen_rect,
         }
@@ -583,6 +743,483 @@ impl RooBarApp {
     }
 }
 
+/// What every widget draws with, resolved once per frame.
+struct WidgetEnv<'a> {
+    style: &'a IslandStyle,
+    font: egui::FontId,
+    fg: egui::Color32,
+    subtext: egui::Color32,
+    island_h: f32,
+    snap: &'a BarStateSnapshot,
+    css: &'a CssStyleSheet,
+}
+
+impl RooBarApp {
+    /// Opens `kind` under `anchor`, or closes it if it is already open.
+    fn toggle_popover(&mut self, ctx: &egui::Context, kind: PopoverKind, anchor: egui::Rect) {
+        if let Some(p) = self.popover.as_mut() {
+            if p.kind == kind {
+                p.begin_close();
+                return;
+            }
+        }
+        // This click is what just closed it (by taking focus away): leave it closed.
+        if self
+            .popover_closed
+            .is_some_and(|(k, at)| k == kind && at.elapsed() < Duration::from_millis(350))
+        {
+            return;
+        }
+        self.popover = Some(Popover::new(ctx, kind, anchor));
+    }
+
+    /// Draws one library widget. `slot` keeps ids unique when a widget is listed twice;
+    /// `in_group` draws it as a segment of a shared pill (`--modules-group`).
+    fn draw_widget(&mut self, ui: &mut egui::Ui, widget: Widget, slot: usize, in_group: bool, env: &WidgetEnv) {
+        let id = egui::Id::new(("widget", widget.name(), slot));
+        let label = |ui: &mut egui::Ui, text: &str, color: egui::Color32, clickable: bool| {
+            pill_label(ui, id, env.style, text, env.font.clone(), color, env.island_h, clickable, in_group)
+        };
+        match widget {
+            Widget::Stats => {
+                let text = format!(
+                    "{} {:>2.0}%  {} {:.1}G",
+                    self.icon("\u{f2db}", "cpu"),
+                    self.cpu_tracker.usage_pct,
+                    self.icon("\u{f233}", "ram"),
+                    self.mem_used_gb
+                );
+                let resp = label(ui, &text, env.fg, true).on_hover_text(format!(
+                    "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
+                    self.mem_used_gb, self.mem_total_gb, self.mem_pct
+                ));
+                if gestures(ui, env.css, widget, &resp).click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Processes, resp.rect);
+                }
+            }
+            Widget::Cpu => {
+                let text = format!("{} {:>2.0}%", self.icon("\u{f2db}", "cpu"), self.cpu_tracker.usage_pct);
+                let resp = label(ui, &text, env.fg, true).on_hover_text("Click for top processes");
+                if gestures(ui, env.css, widget, &resp).click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Processes, resp.rect);
+                }
+            }
+            Widget::Memory => {
+                let text = format!("{} {:.1}G", self.icon("\u{f233}", "ram"), self.mem_used_gb);
+                let resp = label(ui, &text, env.fg, true).on_hover_text(format!(
+                    "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
+                    self.mem_used_gb, self.mem_total_gb, self.mem_pct
+                ));
+                if gestures(ui, env.css, widget, &resp).click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Processes, resp.rect);
+                }
+            }
+            Widget::Notifications => {
+                let s = self.status.snapshot();
+                let icon = if s.dnd {
+                    self.icon("\u{f009b}", "dnd")
+                } else if s.unread > 0 {
+                    self.icon("\u{f009e}", "!")
+                } else {
+                    self.icon("\u{f009a}", "bell")
+                };
+                let text = match (s.dnd, s.unread) {
+                    (true, 0) => format!("{icon} DND"),
+                    (true, n) => format!("{icon} DND ({n})"),
+                    (false, 0) => icon,
+                    (false, n) => format!("{icon} {n}"),
+                };
+                let color = if s.dnd || s.unread > 0 {
+                    env.fg
+                } else {
+                    env.subtext
+                };
+                let hover = match (s.unread, s.dnd) {
+                    (0, false) => "No new notifications".to_owned(),
+                    (n, false) => format!("{n} new notification(s)"),
+                    (n, true) => format!("Do not disturb is on ({n} new)"),
+                };
+                let resp = label(ui, &text, color, true).on_hover_text(format!("{hover}\nClick for the notification center (Super + N)"));
+                if gestures(ui, env.css, widget, &resp).click {
+                    std::thread::spawn(|| {
+                        let _ = send_ipc_command_blocking(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter);
+                    });
+                }
+            }
+            Widget::Tray => {
+                let mut icons = self.status.snapshot().tray;
+                if icons.is_empty() {
+                    return;
+                }
+                // Sync user-defined tray_order with current live icons
+                let live_keys: std::collections::HashSet<(u64, u32)> =
+                    icons.iter().map(|i| (i.hwnd, i.uid)).collect();
+                self.tray_order.retain(|k| live_keys.contains(k));
+                for icon in &icons {
+                    let key = (icon.hwnd, icon.uid);
+                    if !self.tray_order.contains(&key) {
+                        self.tray_order.push(key);
+                    }
+                }
+                icons.sort_by_key(|i| {
+                    self.tray_order
+                        .iter()
+                        .position(|&k| k == (i.hwnd, i.uid))
+                        .unwrap_or(usize::MAX)
+                });
+
+                let (unhidden, hidden_icons): (Vec<_>, Vec<_>) = icons
+                    .into_iter()
+                    .partition(|i| !self.tray_hidden.contains(&(i.hwnd, i.uid)));
+                let visible = env.css.var_px("--tray-visible", 4.0).max(1.0) as usize;
+                let overflow = unhidden.len() > visible || !hidden_icons.is_empty();
+                let mut display_icons: Vec<(chickenwm_core::ipc::TrayIcon, bool)> = if self.tray_expanded {
+                    let mut v: Vec<_> = unhidden.into_iter().map(|i| (i, false)).collect();
+                    v.extend(hidden_icons.into_iter().map(|i| (i, true)));
+                    v
+                } else {
+                    unhidden
+                        .into_iter()
+                        .take(visible)
+                        .map(|i| (i, false))
+                        .collect()
+                };
+                if display_icons.is_empty() && !overflow {
+                    return;
+                }
+                let shown = display_icons.len();
+                let (size, gap, pad, chevron) = (18.0, 7.0, 11.0, 14.0);
+                let icons_w = if shown > 0 {
+                    shown as f32 * (size + gap) - gap
+                } else {
+                    0.0
+                };
+                let w = pad * 2.0 + icons_w + if overflow { (if shown > 0 { gap } else { 0.0 }) + chevron } else { 0.0 };
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(w, env.island_h), egui::Sense::hover());
+                paint_island(ui.painter(), rect, env.style, 0.0);
+                // Textures for icons not seen before (the cache is pruned to the current set).
+                let live: std::collections::HashSet<u64> = display_icons.iter().map(|(i, _)| i.icon).collect();
+                self.tray_textures.retain(|k, _| live.contains(k));
+                let pointer_pos = ui.input(|i| i.pointer.interact_pos());
+                let mut swap_pair: Option<((u64, u32), (u64, u32))> = None;
+
+                for (i, (icon, is_hidden)) in display_icons.drain(..).enumerate() {
+                    let key = (icon.hwnd, icon.uid);
+                    let r = egui::Rect::from_center_size(
+                        egui::pos2(rect.left() + pad + size / 2.0 + i as f32 * (size + gap), rect.center().y),
+                        egui::vec2(size, size),
+                    );
+                    let tex = self.tray_textures.entry(icon.icon).or_insert_with(|| {
+                        tray::icon_rgba(icon.icon).map(|(w, h, px)| {
+                            ui.ctx().load_texture(
+                                format!("tray-{}", icon.icon),
+                                egui::ColorImage::from_rgba_unmultiplied([w, h], &px),
+                                egui::TextureOptions::LINEAR,
+                            )
+                        })
+                    });
+                    let resp = ui.interact(r.expand(3.0), id.with(key), egui::Sense::click_and_drag());
+                    if resp.drag_started() {
+                        self.tray_dragging = Some(key);
+                    }
+                    if let Some(drag_key) = self.tray_dragging {
+                        if drag_key != key && pointer_pos.is_some_and(|p| r.expand(3.0).contains(p)) {
+                            swap_pair = Some((drag_key, key));
+                        }
+                    }
+                    if resp.drag_stopped() {
+                        self.tray_dragging = None;
+                    }
+                    if resp.hovered() || self.tray_dragging == Some(key) {
+                        ui.painter().rect_filled(r.expand(3.0), 4.0, env.fg.gamma_multiply(0.14));
+                    }
+                    let tint = if is_hidden {
+                        egui::Color32::from_white_alpha(105)
+                    } else {
+                        egui::Color32::WHITE
+                    };
+                    match tex {
+                        Some(t) => {
+                            ui.painter().image(
+                                t.id(),
+                                r,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                tint,
+                            );
+                        }
+                        None => {
+                            ui.painter().circle_filled(
+                                r.center(),
+                                size / 3.0,
+                                if is_hidden { env.subtext.gamma_multiply(0.45) } else { env.subtext },
+                            );
+                        }
+                    }
+                    let tip_base = if icon.tip.is_empty() { "Tray icon" } else { &icon.tip };
+                    let tip = if is_hidden {
+                        format!("{tip_base} (hidden)\nMiddle-click to unhide • Drag to reorder")
+                    } else {
+                        format!("{tip_base}\nMiddle-click to hide • Drag to reorder")
+                    };
+                    let resp = resp.on_hover_text(tip);
+                    if resp.middle_clicked() {
+                        if !self.tray_hidden.remove(&key) {
+                            self.tray_hidden.insert(key);
+                        }
+                    } else {
+                        let click = if resp.double_clicked() {
+                            Some(tray::Click::Double)
+                        } else if resp.clicked() {
+                            Some(tray::Click::Left)
+                        } else if resp.secondary_clicked() {
+                            Some(tray::Click::Right)
+                        } else {
+                            None
+                        };
+                        if let Some(click) = click {
+                            let mut pt = windows::Win32::Foundation::POINT::default();
+                            unsafe {
+                                let _ = windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt);
+                            }
+                            tray::send_click(&icon, click, (pt.x, pt.y));
+                        }
+                    }
+                }
+                if let Some((a, b)) = swap_pair {
+                    if let (Some(ia), Some(ib)) = (
+                        self.tray_order.iter().position(|&k| k == a),
+                        self.tray_order.iter().position(|&k| k == b),
+                    ) {
+                        self.tray_order.swap(ia, ib);
+                    }
+                }
+                if overflow {
+                    let c = egui::Rect::from_center_size(egui::pos2(rect.right() - pad - chevron / 2.0, rect.center().y), egui::vec2(chevron, size));
+                    let resp = ui.interact(c, id.with("chevron"), egui::Sense::click());
+                    let glyph = if self.tray_expanded { "›" } else { "‹" };
+                    let color = if resp.hovered() { env.fg } else { env.subtext };
+                    ui.painter().text(c.center(), egui::Align2::CENTER_CENTER, glyph, env.font.clone(), color);
+                    let total_icons = self.tray_order.len();
+                    let hidden_count = total_icons.saturating_sub(shown);
+                    let resp = resp.on_hover_text(if self.tray_expanded {
+                        "Collapse tray".to_owned()
+                    } else {
+                        format!("{hidden_count} more (including hidden)")
+                    });
+                    if resp.clicked() {
+                        self.tray_expanded = !self.tray_expanded;
+                    }
+                }
+            }
+            Widget::Media => {
+                let Some(m) = self.status.snapshot().media else {
+                    return;
+                };
+                let icon = if m.playing { self.icon("\u{f075a}", "♪") } else { self.icon("\u{f03e4}", "||") };
+                let mut text: String = if m.artist.is_empty() {
+                    m.title.clone()
+                } else {
+                    format!("{} — {}", m.title, m.artist)
+                };
+                let max = env.css.var_px("--media-max-chars", 32.0).max(8.0) as usize;
+                if text.chars().count() > max {
+                    text = text.chars().take(max - 1).collect::<String>() + "…";
+                }
+                let color = if m.playing { env.fg } else { env.subtext };
+                let resp = label(ui, &format!("{icon} {text}"), color, true)
+                    .on_hover_text("Click for controls • Middle-click to play/pause");
+                let g = gestures(ui, env.css, widget, &resp);
+                if g.click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Media, resp.rect);
+                }
+                if g.middle {
+                    self.status.send(Cmd::PlayPause);
+                }
+            }
+            Widget::RefreshRate => {
+                let hz = if env.snap.dwm_hook_active && widgets::css_flag(env.css, "--refresh-rate-dwm", true) {
+                    format!("{}Hz · udwm", env.snap.monitor_refresh_hz)
+                } else {
+                    format!("{}Hz", env.snap.monitor_refresh_hz)
+                };
+                let text = format!("{} {}", self.icon("\u{f0e4}", "◔"), hz);
+                label(ui, &text, env.subtext, false);
+            }
+            Widget::Network => {
+                let show_label = widgets::css_flag(env.css, "--network-label", false);
+                let (icon, name, hover, color) = match self.status.snapshot().network {
+                    status::Network::Ethernet {
+                        adapter,
+                        speed_mbps,
+                        ip,
+                    } => (
+                        self.icon("\u{f0200}", "eth"),
+                        "ethernet".to_owned(),
+                        format!(
+                            "Ethernet ({adapter})\nSpeed: {speed_mbps} Mbps • IP: {}",
+                            if ip.is_empty() { "—" } else { &ip }
+                        ),
+                        env.fg,
+                    ),
+                    status::Network::Wifi {
+                        ssid,
+                        signal,
+                        speed_mbps,
+                        ip,
+                    } => {
+                        let bars = match signal {
+                            0..=24 => "\u{f091f}",
+                            25..=49 => "\u{f0922}",
+                            50..=74 => "\u{f0925}",
+                            _ => "\u{f0928}",
+                        };
+                        let hover = format!(
+                            "Wi-Fi: {} ({signal}%)\nSpeed: {speed_mbps} Mbps • IP: {}",
+                            if ssid.is_empty() { "connected" } else { &ssid },
+                            if ip.is_empty() { "—" } else { &ip }
+                        );
+                        (self.icon(bars, "wifi"), ssid, hover, env.fg)
+                    }
+                    status::Network::Disconnected => (
+                        self.icon("\u{f05aa}", "offline"),
+                        "offline".to_owned(),
+                        "Not connected".to_owned(),
+                        env.subtext,
+                    ),
+                };
+                let text = if show_label && !name.is_empty() { format!("{icon} {name}") } else { icon };
+                let resp = label(ui, &text, color, true)
+                    .on_hover_text(format!("{hover}\nClick for Wi-Fi networks • Right-click for network settings"));
+                let g = gestures(ui, env.css, widget, &resp);
+                if g.click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Network, resp.rect);
+                }
+                if g.right {
+                    status::open_uri("ms-settings:network-status");
+                }
+            }
+            Widget::Volume => {
+                let Some(vol) = self.status.snapshot().volume else {
+                    return;
+                };
+                let pct = (vol.level * 100.0).round() as u32;
+                let (text, color) = if vol.muted {
+                    (format!("{} muted", self.icon("\u{f0581}", "mute")), env.subtext)
+                } else {
+                    let icon = match pct {
+                        0..=32 => self.icon("\u{f057f}", "vol"),
+                        33..=65 => self.icon("\u{f0580}", "vol"),
+                        _ => self.icon("\u{f057e}", "vol"),
+                    };
+                    (format!("{icon} {pct}%"), env.fg)
+                };
+                let resp = label(ui, &text, color, true)
+                    .on_hover_text("Click for volume and output • Middle-click to mute • Scroll to change • Right-click for sound settings");
+                let g = gestures(ui, env.css, widget, &resp);
+                if g.click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Volume, resp.rect);
+                }
+                if g.middle {
+                    self.status.send(Cmd::ToggleMute);
+                }
+                if g.right {
+                    status::open_uri("ms-settings:sound");
+                }
+                {
+                    let scroll = g.scroll;
+                    if scroll != 0.0 {
+                        let step = env.css.var_px("--volume-step", 5.0).clamp(1.0, 25.0) / 100.0;
+                        self.status.send(Cmd::Adjust(if scroll > 0.0 { step } else { -step }));
+                    }
+                }
+            }
+            Widget::Bluetooth => {
+                let (text, hover, color) = match self.status.snapshot().bluetooth {
+                    status::Bluetooth::Unavailable => return,
+                    status::Bluetooth::Off => {
+                        (self.icon("\u{f00b2}", "bt off"), "Bluetooth is off".to_owned(), env.subtext)
+                    }
+                    status::Bluetooth::On { devices } if devices.is_empty() => {
+                        (self.icon("\u{f00af}", "bt"), "Bluetooth on, nothing connected".to_owned(), env.fg)
+                    }
+                    status::Bluetooth::On { devices } => {
+                        let icon = self.icon("\u{f00b1}", "bt");
+                        let text = if !widgets::css_flag(env.css, "--bluetooth-label", false) {
+                            icon
+                        } else if devices.len() == 1 {
+                            let name: String = devices[0].chars().take(18).collect();
+                            format!("{icon} {name}")
+                        } else {
+                            format!("{icon} {}", devices.len())
+                        };
+                        (text, format!("Connected: {}", devices.join(", ")), env.fg)
+                    }
+                };
+                let resp = label(ui, &text, color, true).on_hover_text(format!("{hover}\nClick for Bluetooth settings"));
+                if gestures(ui, env.css, widget, &resp).click {
+                    status::open_uri("ms-settings:bluetooth");
+                }
+            }
+            Widget::Files => {
+                let icon = self.icon("\u{f07b}", "📁");
+                let resp = label(ui, &icon, env.fg, true).on_hover_text("Open ChickenWM File Explorer (Super + E)");
+                if gestures(ui, env.css, widget, &resp).click {
+                    spawn_sibling("chickenwm-files.exe");
+                }
+            }
+            Widget::Settings => {
+                let icon = self.icon("\u{f013}", "⚙");
+                let resp = label(ui, &icon, env.fg, true).on_hover_text("Open ChickenWM Settings (Super + I)");
+                if gestures(ui, env.css, widget, &resp).click {
+                    spawn_sibling("chickenwm-settings.exe");
+                }
+            }
+            Widget::Clock => {
+                let fmt = widgets::css_string(env.css, "--clock-format")
+                    .unwrap_or_else(|| widgets::DEFAULT_CLOCK_FORMAT.to_owned());
+                let text = format!("{} {}", self.icon("\u{f017}", "◷"), format_local_clock(&fmt));
+                let resp = label(ui, &text, env.fg, true).on_hover_text("Click for the calendar");
+                if gestures(ui, env.css, widget, &resp).click {
+                    self.toggle_popover(ui.ctx(), PopoverKind::Calendar, resp.rect);
+                }
+            }
+            Widget::Power => {
+                let island_h = env.island_h;
+                let (power_rect, power_resp) =
+                    ui.allocate_exact_size(egui::vec2(island_h + 6.0, island_h), egui::Sense::click());
+                let hover_t =
+                    ui.ctx().animate_bool_with_time(id, power_resp.hovered() || self.power_overlay.is_some(), 0.15);
+                paint_island(ui.painter(), power_rect, env.style, hover_t);
+                paint_power_glyph(ui.painter(), power_rect.center(), island_h * 0.24, env.fg);
+                let power_resp = power_resp.on_hover_text("Shut down / Restart / Log out");
+                if gestures(ui, env.css, widget, &power_resp).click && self.power_overlay.is_none() {
+                    // Snapshot the monitor now, before the overlay window covers it.
+                    let backdrop = Backdrop::capture(ui.ctx(), self.screen_rect);
+                    self.power_overlay = Some(PowerOverlay { opened: Instant::now(), closing: None, shown: false, backdrop });
+                }
+            }
+            Widget::Menu => {
+                let island_h = env.island_h;
+                let menu_open = self.popover.as_ref().is_some_and(|p| matches!(p.kind, PopoverKind::Menu | PopoverKind::About));
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(island_h + 6.0, island_h), egui::Sense::click());
+                let hover_t = ui.ctx().animate_bool_with_time(id, resp.hovered() || menu_open, 0.15);
+                paint_island(ui.painter(), rect, env.style, hover_t);
+                paint_menu_glyph(ui.painter(), rect.center(), island_h * 0.24, env.fg);
+                let resp = resp.on_hover_text("File Explorer, Settings, About, Shut down");
+                if gestures(ui, env.css, widget, &resp).click {
+                    if self.popover.as_ref().is_some_and(|p| p.kind == PopoverKind::About) {
+                        if let Some(p) = self.popover.as_mut() {
+                            p.begin_close();
+                        }
+                    } else {
+                        self.toggle_popover(ui.ctx(), PopoverKind::Menu, resp.rect);
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl eframe::App for RooBarApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
@@ -612,7 +1249,6 @@ impl eframe::App for RooBarApp {
             self.mem_used_gb = u;
             self.mem_total_gb = t;
             self.mem_pct = p;
-            self.clock_text = format_local_clock();
         }
 
         // Periodic fallback sync with `chickenwm-wm` (in addition to instant push over `PIPE_NAME_BAR`)
@@ -678,6 +1314,7 @@ impl eframe::App for RooBarApp {
             border: border_color,
             radius: pill_radius,
             bold,
+            flat: !widgets::css_flag(&css, "--islands", true),
         };
         // Window title: cross-fade + ease the island width whenever the text changes.
         let title_text = if snap.active_window_title.is_empty() {
@@ -703,6 +1340,9 @@ impl eframe::App for RooBarApp {
             ctx.request_repaint();
         }
 
+        // Without islands the bar itself is the one pill: the island fill unless --bar-bg is set.
+        let bar_bg = if style.flat && bar_bg.a() == 0 { island_bg } else { bar_bg };
+        let border_radius = if style.flat { border_radius.max(pill_radius) } else { border_radius };
         let bar_frame = egui::Frame::NONE
             .fill(bar_bg)
             .stroke(if bar_bg.a() > 0 {
@@ -714,15 +1354,23 @@ impl eframe::App for RooBarApp {
             // Room around the islands for their drop shadows.
             .inner_margin(egui::Margin::symmetric(6, 5));
 
+        // The workspace pill under the pointer (for the window previews).
+        let mut hovered_ws: Option<(u32, egui::Rect)> = None;
         egui::CentralPanel::default()
             .frame(bar_frame)
             .show(ctx, |ui| {
                 let island_h = ui.available_height();
-                ui.columns(3, |cols| {
+                {
+                    let full = ui.max_rect();
+                    let mut left_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(full)
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
                     // =========================================================================
                     // LEFT: launcher · workspaces · layout
                     // =========================================================================
-                    cols[0].horizontal_centered(|ui| {
+                    left_ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = island_gap;
 
                         let launcher_text = format!("{} chickenwm", self.icon("\u{f17a}", "❖"));
@@ -821,6 +1469,9 @@ impl eframe::App for RooBarApp {
                                 egui::Id::new(("ws-pill", idx)),
                                 egui::Sense::click(),
                             );
+                            if resp.hovered() && !active && occupied {
+                                hovered_ws = Some((ws_id, *pill));
+                            }
                             let hover_t = ctx.animate_bool_with_time(
                                 egui::Id::new(("ws-hover", idx)),
                                 resp.hovered() && !active,
@@ -917,11 +1568,77 @@ impl eframe::App for RooBarApp {
                             self.dispatch_wm_action(Action::SetLayout(next.to_string()));
                         }
                     });
+                    let left_end = left_ui.min_rect().right();
 
                     // =========================================================================
-                    // CENTER: focused window title
+                    // RIGHT: widgets from the library (`--modules-right`)
                     // =========================================================================
-                    cols[1].vertical_centered(|ui| {
+                    let mut right_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(full)
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    );
+                    right_ui.spacing_mut().item_spacing.x = island_gap;
+                    let env = WidgetEnv {
+                        style: &style,
+                        font: font.clone(),
+                        fg: fg_color,
+                        subtext: subtext_color,
+                        island_h,
+                        snap: &snap,
+                        css: &css,
+                    };
+                    // Listed left to right; the layout fills from the right edge.
+                    for (i, slot) in widgets::right_layout(&css).into_iter().enumerate().rev() {
+                        match slot {
+                            widgets::Slot::Single(widget) => self.draw_widget(&mut right_ui, widget, i, false, &env),
+                            widgets::Slot::Group(members) => {
+                                // One island behind all members, painted once their extent is known.
+                                let bg = right_ui.painter().add(egui::Shape::Noop);
+                                let rect = right_ui
+                                    .scope(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 0.0;
+                                        ui.add_space(3.0);
+                                        for widget in members.into_iter().rev() {
+                                            self.draw_widget(ui, widget, i, true, &env);
+                                        }
+                                        ui.add_space(3.0);
+                                    })
+                                    .response
+                                    .rect;
+                                let island = egui::epaint::RectShape::new(
+                                    rect,
+                                    style.radius,
+                                    style.bg,
+                                    egui::Stroke::new(1.0_f32, style.border),
+                                    egui::StrokeKind::Inside,
+                                );
+                                if !style.flat {
+                                    right_ui.painter().set(bg, island);
+                                }
+                            }
+                        }
+                    }
+                    let right_start = right_ui.min_rect().left();
+
+                    // =========================================================================
+                    // CENTER: focused window title, in the space the two sides leave free.
+                    // Centred on the bar when it fits, otherwise in the middle of the gap.
+                    // =========================================================================
+                    let (lo, hi) = (left_end + island_gap * 2.0, right_start - island_gap * 2.0);
+                    let half = (full.center().x - lo).min(hi - full.center().x);
+                    let gap = if half * 2.0 >= 240.0 {
+                        egui::Rect::from_x_y_ranges(full.center().x - half..=full.center().x + half, full.y_range())
+                    } else {
+                        egui::Rect::from_x_y_ranges(lo..=hi.max(lo), full.y_range())
+                    };
+                    let mut center_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(gap)
+                            .layout(egui::Layout::top_down(egui::Align::Center)),
+                    );
+                    if gap.width() >= 40.0 {
+                        let ui = &mut center_ui;
                         let text = format!("{}  {}", self.icon("\u{f2d0}", "▣"), title_text);
                         let galley = ui.painter().layout_no_wrap(text, font.clone(), fg_color);
                         let target_w = (galley.size().x + 24.0).min(ui.available_width());
@@ -946,130 +1663,91 @@ impl eframe::App for RooBarApp {
                             fg_color.gamma_multiply(title_fade),
                             bold,
                         );
-                    });
-
-                    // =========================================================================
-                    // RIGHT: power · clock · actions · refresh rate · cpu/ram
-                    // =========================================================================
-                    cols[2].with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = island_gap;
-
-                        let (power_rect, power_resp) = ui.allocate_exact_size(
-                            egui::vec2(island_h + 6.0, island_h),
-                            egui::Sense::click(),
-                        );
-                        let hover_t = ctx.animate_bool_with_time(
-                            egui::Id::new("island-power"),
-                            power_resp.hovered() || self.power_overlay.is_some(),
-                            0.15,
-                        );
-                        paint_island(ui.painter(), power_rect, &style, hover_t);
-                        paint_power_glyph(
-                            ui.painter(),
-                            power_rect.center(),
-                            island_h * 0.24,
-                            fg_color,
-                        );
-                        if power_resp.on_hover_text("Shut down / Restart / Log out").clicked()
-                            && self.power_overlay.is_none()
-                        {
-                            // Snapshot the monitor now, before the overlay window covers it.
-                            let backdrop = Backdrop::capture(ui.ctx(), self.screen_rect);
-                            self.power_overlay = Some(PowerOverlay {
-                                opened: Instant::now(),
-                                closing: None,
-                                shown: false,
-                                backdrop,
-                            });
-                        }
-
-                        let clock = format!("{} {}", self.icon("\u{f017}", "◷"), self.clock_text);
-                        island_label(
-                            ui,
-                            egui::Id::new("island-clock"),
-                            &style,
-                            &clock,
-                            font.clone(),
-                            fg_color,
-                            island_h,
-                            false,
-                        );
-
-                        let settings_icon = self.icon("\u{f013}", "⚙");
-                        if island_label(
-                            ui,
-                            egui::Id::new("island-settings"),
-                            &style,
-                            &settings_icon,
-                            font.clone(),
-                            fg_color,
-                            island_h,
-                            true,
-                        )
-                        .on_hover_text("Open ChickenWM Settings (Super + I)")
-                        .clicked()
-                        {
-                            spawn_sibling("chickenwm-settings.exe");
-                        }
-
-                        let files_icon = self.icon("\u{f07b}", "📁");
-                        if island_label(
-                            ui,
-                            egui::Id::new("island-files"),
-                            &style,
-                            &files_icon,
-                            font.clone(),
-                            fg_color,
-                            island_h,
-                            true,
-                        )
-                        .on_hover_text("Open ChickenWM File Explorer (Super + E)")
-                        .clicked()
-                        {
-                            spawn_sibling("chickenwm-files.exe");
-                        }
-
-                        let hz = if snap.dwm_hook_active {
-                            format!("{}Hz · udwm", snap.monitor_refresh_hz)
-                        } else {
-                            format!("{}Hz", snap.monitor_refresh_hz)
-                        };
-                        let hz = format!("{} {}", self.icon("\u{f0e4}", "◔"), hz);
-                        island_label(
-                            ui,
-                            egui::Id::new("island-hz"),
-                            &style,
-                            &hz,
-                            font.clone(),
-                            subtext_color,
-                            island_h,
-                            false,
-                        );
-
-                        let stats = format!(
-                            "{} {:>2.0}%  {} {:.1}G",
-                            self.icon("\u{f2db}", "cpu"),
-                            self.cpu_tracker.usage_pct,
-                            self.icon("\u{f233}", "ram"),
-                            self.mem_used_gb
-                        );
-                        island_label(
-                            ui,
-                            egui::Id::new("island-stats"),
-                            &style,
-                            &stats,
-                            font.clone(),
-                            fg_color,
-                            island_h,
-                            false,
-                        )
-                        .on_hover_text(format!(
-                            "RAM {:.1} / {:.1} GB ({}%)",
-                            self.mem_used_gb, self.mem_total_gb, self.mem_pct
-                        ));
-                    });
-                });
+                    }
+                }
             });
+
+        // Test hook (headless renders): ROOBAR_TEST_POPOVER=calendar|volume|processes|media|network|menu|about opens
+        // that popover on the first frame.
+        static TEST_POPOVER: std::sync::Once = std::sync::Once::new();
+        TEST_POPOVER.call_once(|| {
+            let kind = match std::env::var("ROOBAR_TEST_POPOVER").unwrap_or_default().as_str() {
+                "calendar" => Some(PopoverKind::Calendar),
+                "volume" => Some(PopoverKind::Volume),
+                "processes" => Some(PopoverKind::Processes),
+                "media" => Some(PopoverKind::Media),
+                "network" => Some(PopoverKind::Network),
+                "menu" => Some(PopoverKind::Menu),
+                "about" => Some(PopoverKind::About),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                let w = ctx.screen_rect().width();
+                self.popover = Some(Popover::new(ctx, kind, egui::Rect::from_min_size(egui::pos2(w - 300.0, 0.0), egui::vec2(120.0, 30.0))));
+            }
+        });
+
+        // Workspace previews (not while a popover is open).
+        self.previews.hovered(if self.popover.is_none() { hovered_ws } else { None });
+        if let Some(pv) = self.previews.current.as_mut() {
+            let bar = ctx.input(|i| i.viewport().outer_rect).unwrap_or(ctx.screen_rect());
+            pv.show(ctx, bar, self.screen_rect, island_bg.to_opaque(), border_color, fg_color, pill_radius, egui::FontId::proportional((font_size - 1.0).max(9.0)));
+        }
+        if self.previews.wants_repaint() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+
+        if let Some(p) = self.popover.as_mut() {
+            let bar = ctx.input(|i| i.viewport().outer_rect).unwrap_or(ctx.screen_rect());
+            let pstyle = popover::PopoverStyle {
+                bg: island_bg.to_opaque(),
+                border: border_color,
+                fg: fg_color,
+                subtext: subtext_color,
+                accent_bg: ws_active_bg,
+                accent_fg: ws_active_fg,
+                radius: pill_radius,
+                font: font.clone(),
+                nerd: self.nerd_icons,
+                anim_secs,
+            };
+            let out = p.show(ctx, bar, self.screen_rect, &pstyle, &self.status.snapshot());
+            for cmd in out.cmds {
+                self.status.send(cmd);
+            }
+            if let Some(uri) = out.open_uri {
+                status::open_uri(uri);
+            }
+            let anchor = p.anchor;
+            if out.close {
+                self.popover_closed = Some((p.kind, Instant::now()));
+                self.popover = None;
+            }
+            // Acted on once the menu has faded out, so its window isn't caught in the power
+            // overlay's backdrop and About opens in its place.
+            if let Some(action) = out.menu {
+                self.pending_menu = Some(action);
+            }
+            if self.popover.is_none() {
+                if let Some(action) = self.pending_menu.take() {
+                    match action {
+                        popover::MenuAction::Files => spawn_sibling("chickenwm-files.exe"),
+                        popover::MenuAction::Settings => spawn_sibling("chickenwm-settings.exe"),
+                        popover::MenuAction::AboutPc => status::open_uri("ms-settings:about"),
+                        popover::MenuAction::AboutChickenWm => {
+                            self.popover = Some(Popover::new(ctx, PopoverKind::About, anchor));
+                        }
+                        popover::MenuAction::Shutdown => {
+                            if self.power_overlay.is_none() {
+                                let backdrop = Backdrop::capture(ctx, self.screen_rect);
+                                self.power_overlay =
+                                    Some(PowerOverlay { opened: Instant::now(), closing: None, shown: false, backdrop });
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Power overlay: a transparent full-monitor window that dims the screen and shows the
         // options as cards. Closes on Esc, a click on the dimmed area, or a pick (fade out first).
@@ -1181,6 +1859,7 @@ impl eframe::App for RooBarApp {
                                     border: style.border.gamma_multiply(appear),
                                     radius: style.radius,
                                     bold: style.bold,
+                                    flat: false,
                                 };
                                 let painter = ui.painter();
                                 paint_island(painter, rect, &card_style, hover_t);
@@ -1273,6 +1952,15 @@ async fn main() -> Result<()> {
         css,
         egui_ctx: None,
     }));
+
+    // `--render-to out.png`: draw the bar headless (no window, and none of the bar's IPC, so a
+    // running bar is left alone) and exit.
+    let primary = enumerate_monitors().into_iter().find(|m| m.is_primary);
+    let primary_w = primary.as_ref().map_or(1920.0, |m| m.width as f32);
+    if let Some(req) = chickenwm_core::headless::RenderRequest::from_args([(primary_w - margin_x * 2.0).max(400.0), bar_height]) {
+        let screen_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(primary_w, 1080.0));
+        return chickenwm_core::headless::render_app(&req, |_cc| RooBarApp::new(shared, screen_rect));
+    }
 
     // Watch `~/.config/chickenwm/roobar.css` for <5ms live hot-reload
     let shared_css = Arc::clone(&shared);
@@ -1381,6 +2069,9 @@ async fn main() -> Result<()> {
         .with_inner_size([bar_w, bar_height]);
 
     let native_options = eframe::NativeOptions {
+        // glow, not wgpu: egui_kittest (headless feature) also enables eframe's wgpu backend,
+        // which eframe would then prefer, and wgpu draws transparent windows black on Windows.
+        renderer: eframe::Renderer::Glow,
         viewport,
         ..Default::default()
     };

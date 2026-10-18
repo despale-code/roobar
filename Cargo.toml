@@ -11,7 +11,7 @@ name = "roobar"
 path = "src/main.rs"
 
 [dependencies]
-chickenwm-core = { path = "../chickenwm-core", features = ["egui"] }
+chickenwm-core = { path = "../chickenwm-core", features = ["egui", "headless"] }
 anyhow.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -20,5 +20,26 @@ tracing.workspace = true
 parking_lot.workspace = true
 eframe.workspace = true
 egui.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WiFi",
+    "Win32_Networking_WinSock",
+    "Win32_Devices_Bluetooth",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Ole",
+    "Devices_Radios",
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_System_ProcessStatus",
+] }
 raw-window-handle = "0.6"
+# For `#[windows_core::interface]` (IPolicyConfig); same version the `windows` crate uses.
+windows-core = "0.58"
