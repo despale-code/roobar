@@ -1,9 +1,10 @@
 [package]
 name = "roobar"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
-license.workspace = true
+version = "0.1.1"
+edition = "2024"
+authors = ["ChickenWM Contributors"]
+license = "MIT"
+repository = "https://github.com/despale-code/roobar"
 description = "Waybar-style top status bar for ChickenWM with live CSS styling and direct workspace synchronization"
 
 [[bin]]
@@ -11,16 +12,16 @@ name = "roobar"
 path = "src/main.rs"
 
 [dependencies]
-chickenwm-core = { path = "../chickenwm-core", features = ["egui", "headless"] }
-anyhow.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tracing.workspace = true
-parking_lot.workspace = true
-eframe.workspace = true
-egui.workspace = true
-windows = { workspace = true, features = [
+chickenwm-core = { git = "https://github.com/despale-code/chickenwm-core", tag = "v0.1.1", features = ["egui", "headless"] }
+anyhow = { version = "1.0" }
+tokio = { version = "1.43", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+tracing = { version = "0.1" }
+parking_lot = { version = "0.12" }
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow"] }
+egui = { version = "0.31" }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_StationsAndDesktops", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Performance", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Com", "Win32_System_SystemServices", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Security_Authorization", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Accessibility", "Win32_UI_Shell", "Win32_UI_HiDpi", "Win32_Graphics_Gdi", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dwm", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", 
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_NetworkManagement_IpHelper",
