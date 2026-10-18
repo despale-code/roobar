@@ -606,7 +606,7 @@ dependencies = [
 [[package]]
 name = "chickenwm-core"
 version = "0.1.1"
-source = "git+https://github.com/despale-code/chickenwm-core?tag=v0.1.1#4eafbbb8611561f32cef5d96da8657607a3adedb"
+source = "git+https://github.com/despale-code/chickenwm-core?tag=v0.1.2#e3ec79305a456fa57b2e7685b9fea86d8835a9b1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
