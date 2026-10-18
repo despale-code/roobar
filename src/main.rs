@@ -2059,6 +2059,7 @@ async fn main() -> Result<()> {
     );
 
     let viewport = egui::ViewportBuilder::default()
+            .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon-64.rgba").to_vec(), width: 64, height: 64 })
         .with_title("ChickenWM Bar — roobar")
         .with_decorations(false)
         .with_transparent(true)
