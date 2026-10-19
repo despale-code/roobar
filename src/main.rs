@@ -650,6 +650,7 @@ struct RooBarApp {
     hover_cards: hovercard::HoverCards,
     /// Monitor the bar lives on, in the same units the viewports are positioned in.
     screen_rect: egui::Rect,
+    last_float: Option<bool>,
 }
 
 impl RooBarApp {
@@ -680,6 +681,7 @@ impl RooBarApp {
             pending_menu: None,
             popover: None,
             popover_closed: None,
+            last_float: None,
             tray_textures: Default::default(),
             tray_order: Vec::new(),
             tray_hidden: Default::default(),
@@ -1347,13 +1349,27 @@ impl eframe::App for RooBarApp {
         let anim_secs = (css.var_px("--anim-ms", 220.0) / 1000.0).max(0.01);
         let font = egui::FontId::proportional(font_size);
 
+        let is_float = widgets::css_flag(&css, "--float", true);
+        if self.last_float != Some(is_float) {
+            self.last_float = Some(is_float);
+            let bar_height = css.var_px("--bar-height", 36.0);
+            let margin_top = if is_float { css.var_px("--bar-margin-top", 6.0) } else { 0.0 };
+            let margin_x = if is_float { css.var_px("--bar-margin-x", 10.0) } else { 0.0 };
+            let bar_x = if is_float { self.screen_rect.min.x + margin_x } else { self.screen_rect.min.x };
+            let bar_y = if is_float { self.screen_rect.min.y + margin_top } else { self.screen_rect.min.y };
+            let bar_w = if is_float { (self.screen_rect.width() - margin_x * 2.0).max(400.0) } else { self.screen_rect.width() };
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(bar_w, bar_height)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(bar_x, bar_y)));
+        }
+
+        let islands_enabled = is_float && widgets::css_flag(&css, "--islands", true);
         let style = IslandStyle {
             bg: island_bg,
             hover_bg: island_bg.lerp_to_gamma(accent_color, 0.55),
             border: border_color,
-            radius: pill_radius,
+            radius: if is_float { pill_radius } else { 0.0 },
             bold,
-            flat: !widgets::css_flag(&css, "--islands", true),
+            flat: !islands_enabled,
         };
         // Window title: cross-fade + ease the island width whenever the text changes.
         let title_text = if snap.active_window_title.is_empty() {
@@ -1381,17 +1397,29 @@ impl eframe::App for RooBarApp {
 
         // Without islands the bar itself is the one pill: the island fill unless --bar-bg is set.
         let bar_bg = if style.flat && bar_bg.a() == 0 { island_bg } else { bar_bg };
-        let border_radius = if style.flat { border_radius.max(pill_radius) } else { border_radius };
+        let border_radius = if !is_float {
+            0.0
+        } else if style.flat {
+            border_radius.max(pill_radius)
+        } else {
+            border_radius
+        };
         let bar_frame = egui::Frame::NONE
             .fill(bar_bg)
-            .stroke(if bar_bg.a() > 0 {
+            .stroke(if is_float && bar_bg.a() > 0 {
+                egui::Stroke::new(1.0_f32, border_color)
+            } else if !is_float && bar_bg.a() > 0 {
                 egui::Stroke::new(1.0_f32, border_color)
             } else {
                 egui::Stroke::NONE
             })
             .corner_radius(border_radius)
             // Room around the islands for their drop shadows.
-            .inner_margin(egui::Margin::symmetric(6, 5));
+            .inner_margin(if is_float {
+                egui::Margin::symmetric(6, 5)
+            } else {
+                egui::Margin::symmetric(10, 3)
+            });
 
         // The workspace pill under the pointer (for the window previews).
         let mut hovered_ws: Option<(u32, egui::Rect)> = None;
@@ -1772,7 +1800,6 @@ impl eframe::App for RooBarApp {
                     match action {
                         popover::MenuAction::Files => spawn_sibling("chickenwm-files.exe"),
                         popover::MenuAction::Settings => spawn_sibling("chickenwm-settings.exe"),
-                        popover::MenuAction::AboutPc => status::open_uri("ms-settings:about"),
                         popover::MenuAction::AboutChickenWm => {
                             self.popover = Some(Popover::new(ctx, PopoverKind::About, anchor));
                         }
@@ -1989,9 +2016,10 @@ async fn main() -> Result<()> {
     let _ = bootstrap_config_and_themes();
 
     let css = load_css_sheet("roobar.css").unwrap_or_default();
+    let is_float = widgets::css_flag(&css, "--float", true);
     let bar_height = css.var_px("--bar-height", 36.0);
-    let margin_top = css.var_px("--bar-margin-top", 6.0);
-    let margin_x = css.var_px("--bar-margin-x", 10.0);
+    let margin_top = if is_float { css.var_px("--bar-margin-top", 6.0) } else { 0.0 };
+    let margin_x = if is_float { css.var_px("--bar-margin-x", 10.0) } else { 0.0 };
 
     // Fetch initial workspace state from `chickenwm-wm` if running
     let initial_snapshot = match send_ipc_command_blocking(PIPE_NAME_WM, &IpcCommand::QueryBarState)
@@ -2098,9 +2126,9 @@ async fn main() -> Result<()> {
             active_workspace_id: 1,
             is_primary: true,
         });
-    let bar_x = (mon.x as f32) + margin_x;
-    let bar_y = (mon.y as f32) + margin_top;
-    let bar_w = ((mon.width as f32) - margin_x * 2.0).max(400.0);
+    let bar_x = if is_float { (mon.x as f32) + margin_x } else { mon.x as f32 };
+    let bar_y = if is_float { (mon.y as f32) + margin_top } else { mon.y as f32 };
+    let bar_w = if is_float { ((mon.width as f32) - margin_x * 2.0).max(400.0) } else { mon.width as f32 };
     let screen_rect = egui::Rect::from_min_size(
         egui::pos2(mon.x as f32, mon.y as f32),
         egui::vec2(mon.width as f32, mon.height as f32),

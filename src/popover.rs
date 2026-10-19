@@ -31,20 +31,18 @@ pub enum PopoverKind {
 pub enum MenuAction {
     Files,
     Settings,
-    AboutPc,
     AboutChickenWm,
     Shutdown,
 }
 
 impl MenuAction {
-    pub const ALL: [MenuAction; 5] =
-        [MenuAction::Files, MenuAction::Settings, MenuAction::AboutPc, MenuAction::AboutChickenWm, MenuAction::Shutdown];
+    pub const ALL: [MenuAction; 4] =
+        [MenuAction::Files, MenuAction::Settings, MenuAction::AboutChickenWm, MenuAction::Shutdown];
 
     fn label(self) -> &'static str {
         match self {
             MenuAction::Files => "File Explorer",
             MenuAction::Settings => "Settings",
-            MenuAction::AboutPc => "About this PC",
             MenuAction::AboutChickenWm => "About ChickenWM",
             MenuAction::Shutdown => "Shut down…",
         }
