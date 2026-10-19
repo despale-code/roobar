@@ -134,8 +134,6 @@ pub struct Popover {
     pub closing: Option<Instant>,
     /// True once DWM transitions have been disabled on the popover HWND.
     shown: bool,
-    /// Captured desktop region under the popover for frosted blur + dim treatment.
-    backdrop: Option<(egui::Rect, crate::Backdrop)>,
     /// Keyboard-selected row index for list navigation.
     selected_idx: usize,
     /// The cursor has been over the popover (or its widget) since it opened.
@@ -145,7 +143,7 @@ pub struct Popover {
 }
 
 /// How long the cursor may be away from a popover before it closes.
-const HOVER_LEAVE_GRACE: Duration = Duration::from_millis(300);
+const HOVER_LEAVE_GRACE: Duration = Duration::from_millis(450);
 
 /// Colours and font the popover draws with (the bar's own).
 pub struct PopoverStyle {
@@ -186,7 +184,6 @@ impl Popover {
             opened: Instant::now(),
             closing: None,
             shown: false,
-            backdrop: None,
             selected_idx: 0,
             hovered_once: false,
             left_at: None,
@@ -216,14 +213,6 @@ impl Popover {
             .clamp(screen.left() + 6.0, (screen.right() - size.x - 6.0).max(screen.left()));
         let pos = egui::pos2(x, bar.bottom() + 6.0);
         let pop_rect = egui::Rect::from_min_size(pos, size);
-        // Captured at the largest size, so the backdrop still fits when the window shrinks.
-        let capture_rect = egui::Rect::from_min_size(pos, max_size);
-
-        if self.backdrop.as_ref().is_none_or(|(r, _)| *r != capture_rect) && !self.shown {
-            if let Some(bd) = crate::Backdrop::capture(ctx, capture_rect) {
-                self.backdrop = Some((capture_rect, bd));
-            }
-        }
 
         // Hovering off closes it: once the cursor has been over the popover or its widget, being
         // away from both (and the gap between them) for a moment dismisses it. Not while a button
@@ -238,11 +227,13 @@ impl Popover {
             });
             let widget = self.anchor.translate(bar.min.to_vec2());
             let gap = egui::Rect::from_min_max(
-                egui::pos2(widget.left().max(pop_rect.left()), widget.bottom() - 2.0),
-                egui::pos2(widget.right().min(pop_rect.right()), pop_rect.top() + 2.0),
+                egui::pos2(widget.left().max(pop_rect.left()), widget.bottom() - 4.0),
+                egui::pos2(widget.right().min(pop_rect.right()), pop_rect.top() + 4.0),
             );
             let inside = cursor.is_some_and(|p| {
-                pop_rect.expand(8.0).contains(p) || widget.expand(4.0).contains(p) || gap.expand2(egui::vec2(6.0, 0.0)).contains(p)
+                pop_rect.expand(16.0).contains(p)
+                    || widget.expand(6.0).contains(p)
+                    || gap.expand2(egui::vec2(16.0, 6.0)).contains(p)
             });
             let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
                 .iter()
@@ -335,30 +326,20 @@ impl Popover {
                 let card_rect = full.translate(egui::vec2(0.0, slide_y));
                 let painter = pctx.layer_painter(egui::LayerId::background());
 
-                // Frosted blur + dim backdrop treatment matching the power menu; the part of the
-                // capture this (possibly shrunk) window covers.
-                if let Some((cap, bd)) = &self.backdrop {
-                    let uv = egui::Rect::from_min_max(
-                        egui::pos2(0.0, 0.0),
-                        egui::pos2((full.width() / cap.width()).min(1.0), (full.height() / cap.height()).min(1.0)),
-                    );
-                    painter.image(bd.sharp.id(), full, uv, egui::Color32::WHITE);
-                    let v = (145.0 * appear) as u8;
-                    let a = (255.0 * appear) as u8;
-                    painter.image(
-                        bd.blurred.id(),
-                        full,
-                        uv,
-                        egui::Color32::from_rgba_premultiplied(v, v, v, a),
-                    );
-                }
-
-                // Tinted surface (media popover mixes theme accent into the surface)
+                // Clean translucent surface (media popover mixes theme accent into the surface)
                 let surface_fill = if self.kind == PopoverKind::Media {
-                    blend_color(eff_style.bg. gamma_multiply(0.86), eff_style.accent_bg, 0.14)
+                    blend_color(eff_style.bg.gamma_multiply(0.92), eff_style.accent_bg, 0.16)
                 } else {
-                    eff_style.bg.gamma_multiply(0.88)
+                    eff_style.bg.gamma_multiply(0.94)
                 };
+                let shadow_color = egui::Color32::from_black_alpha((75.0 * appear) as u8);
+                painter.rect(
+                    card_rect.expand(2.0),
+                    eff_style.radius + 2.0,
+                    egui::Color32::TRANSPARENT,
+                    egui::Stroke::new(1.0_f32, shadow_color),
+                    egui::StrokeKind::Outside,
+                );
                 painter.rect(
                     card_rect,
                     eff_style.radius,
@@ -894,13 +875,22 @@ impl Popover {
         } else {
             egui::ScrollArea::vertical().max_height(190.0).show(ui, |ui| {
                 for (idx, net) in status.wifi_networks.iter().enumerate() {
-                    let bars = match net.signal {
-                        0..=24 => "▂___",
-                        25..=49 => "▂▄__",
-                        50..=74 => "▂▄▆_",
-                        _ => "▂▄▆█",
+                    let bars = if style.nerd {
+                        match net.signal {
+                            0..=24 => "\u{f091f}", // 1 bar
+                            25..=49 => "\u{f0922}", // 2 bars
+                            50..=74 => "\u{f0925}", // 3 bars
+                            _ => "\u{f0928}", // 4 bars
+                        }
+                    } else {
+                        match net.signal {
+                            0..=24 => "[•   ]",
+                            25..=49 => "[••  ]",
+                            50..=74 => "[••• ]",
+                            _ => "[••••]",
+                        }
                     };
-                    let lock = if net.secured { "🔒" } else { "  " };
+                    let lock = if net.secured { if style.nerd { "\u{f023}" } else { "🔒" } } else { "  " };
                     let state = if net.connected { " (connected)" } else { "" };
                     let label = format!("{bars} {lock} {}{state}  {}%", net.ssid, net.signal);
                     let is_sel = net.connected || idx == self.selected_idx;

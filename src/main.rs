@@ -1159,6 +1159,43 @@ impl RooBarApp {
                     status::open_uri("ms-settings:bluetooth");
                 }
             }
+            Widget::Battery => {
+                let Some(bat) = self.status.snapshot().battery else {
+                    return; // Guard: Desktop PC or VM with no battery — completely omitted!
+                };
+                let pct = bat.percent;
+                let icon = if bat.charging {
+                    self.icon("\u{f0084}", "⚡")
+                } else {
+                    match pct {
+                        0..=15 => self.icon("\u{f007a}", "!"),
+                        16..=35 => self.icon("\u{f007b}", "bat"),
+                        36..=60 => self.icon("\u{f007c}", "bat"),
+                        61..=85 => self.icon("\u{f007d}", "bat"),
+                        _ => self.icon("\u{f0079}", "bat"),
+                    }
+                };
+                let (text, color) = if bat.charging {
+                    (format!("{icon} {pct}%"), env.fg)
+                } else if pct <= 15 {
+                    (format!("{icon} {pct}%"), egui::Color32::from_rgb(235, 95, 95))
+                } else {
+                    (format!("{icon} {pct}%"), env.fg)
+                };
+                let tooltip = match (bat.charging, bat.remaining_seconds) {
+                    (true, _) => format!("Battery: {pct}% (Charging)"),
+                    (false, Some(sec)) => {
+                        let mins = (sec / 60) % 60;
+                        let hrs = sec / 3600;
+                        format!("Battery: {pct}%\n{hrs}h {mins}m remaining")
+                    }
+                    (false, None) => format!("Battery: {pct}%"),
+                };
+                let resp = label(ui, &text, color, true).hover_card(tooltip);
+                if gestures(ui, env.css, widget, &resp).click {
+                    status::open_uri("ms-settings:batterysaver");
+                }
+            }
             Widget::Files => {
                 let icon = self.icon("\u{f07b}", "📁");
                 let resp = label(ui, &icon, env.fg, true).hover_card("Open ChickenWM File Explorer (Super + E)");

@@ -30,6 +30,8 @@ pub enum Widget {
     Network,
     Volume,
     Bluetooth,
+    /// Battery indicator; hidden on desktop PCs and devices without a battery.
+    Battery,
     /// Now playing (Windows media session); hidden when nothing is.
     Media,
     /// System tray icons (hosted by rooster), with an overflow chevron.
@@ -46,7 +48,7 @@ pub enum Widget {
 
 impl Widget {
     /// Every widget with the name it goes by in `--modules-right`.
-    pub const ALL: [(&'static str, Widget); 15] = [
+    pub const ALL: [(&'static str, Widget); 16] = [
         ("stats", Widget::Stats),
         ("cpu", Widget::Cpu),
         ("memory", Widget::Memory),
@@ -54,6 +56,7 @@ impl Widget {
         ("network", Widget::Network),
         ("volume", Widget::Volume),
         ("bluetooth", Widget::Bluetooth),
+        ("battery", Widget::Battery),
         ("media", Widget::Media),
         ("tray", Widget::Tray),
         ("notifications", Widget::Notifications),
@@ -73,6 +76,7 @@ impl Widget {
             "wifi" | "ethernet" | "net" => "network",
             "audio" | "sound" => "volume",
             "bt" => "bluetooth",
+            "bat" => "battery",
             "music" | "player" | "now-playing" => "media",
             "systray" | "tray-icons" => "tray",
             "notification" | "bell" | "notify" => "notifications",
@@ -89,21 +93,22 @@ impl Widget {
 }
 
 /// The default right side: the refresh-rate widget is in the library but not shown.
-pub const DEFAULT_RIGHT: [Widget; 9] = [
+pub const DEFAULT_RIGHT: [Widget; 10] = [
     Widget::Media,
     Widget::Stats,
     Widget::Tray,
     Widget::Network,
     Widget::Volume,
     Widget::Bluetooth,
+    Widget::Battery,
     Widget::Clock,
     Widget::Notifications,
     Widget::Menu,
 ];
 
 /// The default `--modules-group`: these share one pill, in this order.
-pub const DEFAULT_GROUP: [Widget; 5] =
-    [Widget::Network, Widget::Volume, Widget::Bluetooth, Widget::Clock, Widget::Notifications];
+pub const DEFAULT_GROUP: [Widget; 6] =
+    [Widget::Network, Widget::Volume, Widget::Bluetooth, Widget::Battery, Widget::Clock, Widget::Notifications];
 
 pub const DEFAULT_CLOCK_FORMAT: &str = "%a %Y-%m-%d  %H:%M";
 
@@ -315,7 +320,7 @@ mod tests {
         use Widget::*;
         let l = layout_with_group(&DEFAULT_RIGHT, &DEFAULT_GROUP);
         assert_eq!(l.len(), 5);
-        assert_eq!(l[3], Slot::Group(vec![Network, Volume, Bluetooth, Clock, Notifications]));
+        assert_eq!(l[3], Slot::Group(vec![Network, Volume, Bluetooth, Battery, Clock, Notifications]));
         assert_eq!(l[4], Slot::Single(Menu));
         // Members missing from --modules-right drop out; fewer than two means no group.
         assert_eq!(

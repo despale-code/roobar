@@ -40,6 +40,7 @@ windows = { version = "0.58", features = ["Win32_Foundation", "Win32_System_Thre
     "Win32_Devices_Properties",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_ProcessStatus",
+    "Win32_System_Power",
 ] }
 raw-window-handle = "0.6"
 # For `#[windows_core::interface]` (IPolicyConfig); same version the `windows` crate uses.

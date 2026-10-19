@@ -81,6 +81,16 @@ pub enum Bluetooth {
     On { devices: Vec<String> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Battery {
+    /// 0 ..= 100
+    pub percent: u8,
+    pub charging: bool,
+    pub ac_online: bool,
+    /// Estimated lifetime remaining in seconds, if known
+    pub remaining_seconds: Option<u32>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Status {
     pub network: Network,
@@ -88,6 +98,8 @@ pub struct Status {
     /// `None` when there is no output device.
     pub volume: Option<Volume>,
     pub bluetooth: Bluetooth,
+    /// `None` on desktop PCs, VMs, or devices without a battery.
+    pub battery: Option<Battery>,
     /// Active playback devices; the default one is marked.
     pub outputs: Vec<Output>,
     /// The current media session (what Windows' media flyout shows), if any.
@@ -207,6 +219,7 @@ impl StatusMonitor {
                     next.network = query_network(wlan.as_mut());
                     next.wifi_networks = wlan.as_mut().map(|w| w.available_networks()).unwrap_or_default();
                     next.bluetooth = query_bluetooth();
+                    next.battery = query_battery();
                 }
                 if media_at.elapsed() >= Duration::from_secs(1) {
                     media_at = Instant::now();
@@ -521,6 +534,7 @@ impl MediaSessions {
         (current, all)
     }
 
+    #[cfg(test)]
     fn current(&mut self) -> Option<Media> {
         self.poll_all().0
     }
@@ -830,6 +844,43 @@ fn connected_devices() -> Vec<String> {
         let _ = BluetoothFindDeviceClose(find);
     }
     out
+}
+
+/// Queries system battery status with strict hardware guards.
+/// Returns `None` on desktop PCs, virtual machines, or devices without a functional battery.
+pub fn query_battery() -> Option<Battery> {
+    unsafe {
+        let mut sps = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
+        if windows::Win32::System::Power::GetSystemPowerStatus(&mut sps).is_err() {
+            return None;
+        }
+
+        // Critical Hardware Guard:
+        // BatteryFlag:
+        //   128 = No system battery (desktop PC, VM)
+        //   255 = Unable to read battery flag
+        // BatteryLifePercent:
+        //   255 = Unknown status (desktop PC without battery)
+        if sps.BatteryFlag & 128 != 0 || sps.BatteryFlag == 255 || sps.BatteryLifePercent == 255 {
+            return None;
+        }
+
+        let percent = sps.BatteryLifePercent.min(100);
+        let charging = (sps.BatteryFlag & 8) != 0;
+        let ac_online = sps.ACLineStatus == 1;
+        let remaining_seconds = if sps.BatteryLifeTime != 0xFFFFFFFF && sps.BatteryLifeTime > 0 {
+            Some(sps.BatteryLifeTime)
+        } else {
+            None
+        };
+
+        Some(Battery {
+            percent,
+            charging,
+            ac_online,
+            remaining_seconds,
+        })
+    }
 }
 
 #[cfg(test)]
