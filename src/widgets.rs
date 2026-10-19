@@ -10,7 +10,6 @@
 //!     --modules-group: network volume bluetooth clock notifications;
 //!     --tray-visible: 4;                   /* tray icons before the overflow chevron */
 //!     --clock-format: %a %Y-%m-%d  %H:%M;   /* strftime-style; add :%S for seconds */
-//!     --refresh-rate-dwm: true;             /* "165Hz · udwm" when the DWM hook is active */
 //!     --network-label: false;               /* Wi-Fi name / "ethernet" next to the icon */
 //!     --bluetooth-label: false;             /* connected device name next to the icon */
 //!     --volume-step: 5;                     /* percent per scroll notch */
@@ -26,7 +25,7 @@ pub enum Widget {
     Stats,
     Cpu,
     Memory,
-    /// Monitor refresh rate (and the DWM hook state).
+    /// Monitor refresh rate.
     RefreshRate,
     Network,
     Volume,

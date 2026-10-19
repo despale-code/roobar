@@ -1041,12 +1041,7 @@ impl RooBarApp {
                 }
             }
             Widget::RefreshRate => {
-                let hz = if env.snap.dwm_hook_active && widgets::css_flag(env.css, "--refresh-rate-dwm", true) {
-                    format!("{}Hz · udwm", env.snap.monitor_refresh_hz)
-                } else {
-                    format!("{}Hz", env.snap.monitor_refresh_hz)
-                };
-                let text = format!("{} {}", self.icon("\u{f0e4}", "◔"), hz);
+                let text = format!("{} {}Hz", self.icon("\u{f0e4}", "◔"), env.snap.monitor_refresh_hz);
                 label(ui, &text, env.subtext, false);
             }
             Widget::Network => {
