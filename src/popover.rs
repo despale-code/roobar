@@ -5,6 +5,7 @@
 //! Each is a small borderless always-on-top viewport placed under its widget. It closes on Esc,
 //! when it loses focus (a click anywhere else), or when its widget is clicked again.
 
+use crate::hovercard::HoverCardExt;
 use crate::procs::{self, ProcRow, ProcSampler};
 use crate::status::{Cmd, Status};
 use crate::widgets;
@@ -137,7 +138,14 @@ pub struct Popover {
     backdrop: Option<(egui::Rect, crate::Backdrop)>,
     /// Keyboard-selected row index for list navigation.
     selected_idx: usize,
+    /// The cursor has been over the popover (or its widget) since it opened.
+    hovered_once: bool,
+    /// When the cursor left the popover and its widget (it closes shortly after).
+    left_at: Option<Instant>,
 }
+
+/// How long the cursor may be away from a popover before it closes.
+const HOVER_LEAVE_GRACE: Duration = Duration::from_millis(300);
 
 /// Colours and font the popover draws with (the bar's own).
 pub struct PopoverStyle {
@@ -180,6 +188,8 @@ impl Popover {
             shown: false,
             backdrop: None,
             selected_idx: 0,
+            hovered_once: false,
+            left_at: None,
         }
     }
 
@@ -214,6 +224,39 @@ impl Popover {
                 self.backdrop = Some((capture_rect, bd));
             }
         }
+
+        // Hovering off closes it: once the cursor has been over the popover or its widget, being
+        // away from both (and the gap between them) for a moment dismisses it. Not while a button
+        // is held (dragging the volume slider past the edge).
+        let left_by_hover = {
+            use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
+            use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+            let mut pt = windows::Win32::Foundation::POINT::default();
+            let cursor = unsafe { GetCursorPos(&mut pt) }.is_ok().then(|| {
+                let ppp = ctx.pixels_per_point();
+                egui::pos2(pt.x as f32 / ppp, pt.y as f32 / ppp)
+            });
+            let widget = self.anchor.translate(bar.min.to_vec2());
+            let gap = egui::Rect::from_min_max(
+                egui::pos2(widget.left().max(pop_rect.left()), widget.bottom() - 2.0),
+                egui::pos2(widget.right().min(pop_rect.right()), pop_rect.top() + 2.0),
+            );
+            let inside = cursor.is_some_and(|p| {
+                pop_rect.expand(8.0).contains(p) || widget.expand(4.0).contains(p) || gap.expand2(egui::vec2(6.0, 0.0)).contains(p)
+            });
+            let held = [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
+                .iter()
+                .any(|k| unsafe { GetAsyncKeyState(i32::from(k.0)) } as u16 & 0x8000 != 0);
+            if inside || held {
+                self.hovered_once |= inside;
+                self.left_at = None;
+                false
+            } else if self.hovered_once {
+                self.left_at.get_or_insert_with(Instant::now).elapsed() >= HOVER_LEAVE_GRACE
+            } else {
+                false
+            }
+        };
 
         // A click anywhere outside the popover (and its widget, which toggles it itself) closes
         // it. Polled, because the popover doesn't always get focus to lose.
@@ -261,6 +304,7 @@ impl Popover {
         let mut out = Outcome::default();
         let mut request_dismiss = false;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("roobar-popover"), builder, |pctx, _class| {
+            crate::hovercard::set_origin(pos);
             if self.applied_size != Some(size) {
                 if self.applied_size.is_some() {
                     pctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
@@ -364,7 +408,7 @@ impl Popover {
             }
             // Lost focus = clicked elsewhere. Ignore the first moments while focus settles.
             let lost = self.focused_once && focused == Some(false) && self.opened.elapsed() > Duration::from_millis(250);
-            if esc || close || lost || clicked_outside || out.close {
+            if esc || close || lost || clicked_outside || left_by_hover || out.close {
                 out.close = false;
                 request_dismiss = true;
             }
@@ -565,7 +609,7 @@ impl Popover {
                     [ui.available_width(), 24.0],
                     egui::Button::new(text).selected(is_sel).frame(true).truncate(),
                 )
-                .on_hover_text(&o.name);
+                .hover_card(o.name.clone());
             if resp.clicked() && !o.default {
                 self.selected_idx = idx;
                 out.cmds.push(Cmd::SetOutput(o.id.clone()));

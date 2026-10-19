@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::info;
 
+mod hovercard;
 mod popover;
 mod previews;
 mod procs;
@@ -39,6 +40,7 @@ mod tray;
 mod status;
 mod widgets;
 
+use hovercard::HoverCardExt;
 use popover::{Popover, PopoverKind};
 use status::{Cmd, StatusMonitor};
 use widgets::Widget;
@@ -645,6 +647,7 @@ struct RooBarApp {
     tray_expanded: bool,
     /// Live window thumbnails when hovering a workspace pill.
     previews: previews::Previews,
+    hover_cards: hovercard::HoverCards,
     /// Monitor the bar lives on, in the same units the viewports are positioned in.
     screen_rect: egui::Rect,
 }
@@ -683,6 +686,7 @@ impl RooBarApp {
             tray_dragging: None,
             tray_expanded: false,
             previews: Default::default(),
+            hover_cards: Default::default(),
             bar_hwnd: None,
             screen_rect,
         }
@@ -789,7 +793,7 @@ impl RooBarApp {
                     self.icon("\u{f233}", "ram"),
                     self.mem_used_gb
                 );
-                let resp = label(ui, &text, env.fg, true).on_hover_text(format!(
+                let resp = label(ui, &text, env.fg, true).hover_card(format!(
                     "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
                     self.mem_used_gb, self.mem_total_gb, self.mem_pct
                 ));
@@ -799,14 +803,14 @@ impl RooBarApp {
             }
             Widget::Cpu => {
                 let text = format!("{} {:>2.0}%", self.icon("\u{f2db}", "cpu"), self.cpu_tracker.usage_pct);
-                let resp = label(ui, &text, env.fg, true).on_hover_text("Click for top processes");
+                let resp = label(ui, &text, env.fg, true).hover_card("Click for top processes");
                 if gestures(ui, env.css, widget, &resp).click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Processes, resp.rect);
                 }
             }
             Widget::Memory => {
                 let text = format!("{} {:.1}G", self.icon("\u{f233}", "ram"), self.mem_used_gb);
-                let resp = label(ui, &text, env.fg, true).on_hover_text(format!(
+                let resp = label(ui, &text, env.fg, true).hover_card(format!(
                     "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
                     self.mem_used_gb, self.mem_total_gb, self.mem_pct
                 ));
@@ -839,7 +843,7 @@ impl RooBarApp {
                     (n, false) => format!("{n} new notification(s)"),
                     (n, true) => format!("Do not disturb is on ({n} new)"),
                 };
-                let resp = label(ui, &text, color, true).on_hover_text(format!("{hover}\nClick for the notification center (Super + N)"));
+                let resp = label(ui, &text, color, true).hover_card(format!("{hover}\nClick for the notification center (Super + N)"));
                 if gestures(ui, env.css, widget, &resp).click {
                     std::thread::spawn(|| {
                         let _ = send_ipc_command_blocking(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter);
@@ -961,7 +965,7 @@ impl RooBarApp {
                     } else {
                         format!("{tip_base}\nMiddle-click to hide • Drag to reorder")
                     };
-                    let resp = resp.on_hover_text(tip);
+                    let resp = resp.hover_card(tip);
                     if resp.middle_clicked() {
                         if !self.tray_hidden.remove(&key) {
                             self.tray_hidden.insert(key);
@@ -1001,7 +1005,7 @@ impl RooBarApp {
                     ui.painter().text(c.center(), egui::Align2::CENTER_CENTER, glyph, env.font.clone(), color);
                     let total_icons = self.tray_order.len();
                     let hidden_count = total_icons.saturating_sub(shown);
-                    let resp = resp.on_hover_text(if self.tray_expanded {
+                    let resp = resp.hover_card(if self.tray_expanded {
                         "Collapse tray".to_owned()
                     } else {
                         format!("{hidden_count} more (including hidden)")
@@ -1027,7 +1031,7 @@ impl RooBarApp {
                 }
                 let color = if m.playing { env.fg } else { env.subtext };
                 let resp = label(ui, &format!("{icon} {text}"), color, true)
-                    .on_hover_text("Click for controls • Middle-click to play/pause");
+                    .hover_card("Click for controls • Middle-click to play/pause");
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Media, resp.rect);
@@ -1089,7 +1093,7 @@ impl RooBarApp {
                 };
                 let text = if show_label && !name.is_empty() { format!("{icon} {name}") } else { icon };
                 let resp = label(ui, &text, color, true)
-                    .on_hover_text(format!("{hover}\nClick for Wi-Fi networks • Right-click for network settings"));
+                    .hover_card(format!("{hover}\nClick for Wi-Fi networks • Right-click for network settings"));
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Network, resp.rect);
@@ -1114,7 +1118,7 @@ impl RooBarApp {
                     (format!("{icon} {pct}%"), env.fg)
                 };
                 let resp = label(ui, &text, color, true)
-                    .on_hover_text("Click for volume and output • Middle-click to mute • Scroll to change • Right-click for sound settings");
+                    .hover_card("Click for volume and output • Middle-click to mute • Scroll to change • Right-click for sound settings");
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Volume, resp.rect);
@@ -1155,21 +1159,21 @@ impl RooBarApp {
                         (text, format!("Connected: {}", devices.join(", ")), env.fg)
                     }
                 };
-                let resp = label(ui, &text, color, true).on_hover_text(format!("{hover}\nClick for Bluetooth settings"));
+                let resp = label(ui, &text, color, true).hover_card(format!("{hover}\nClick for Bluetooth settings"));
                 if gestures(ui, env.css, widget, &resp).click {
                     status::open_uri("ms-settings:bluetooth");
                 }
             }
             Widget::Files => {
                 let icon = self.icon("\u{f07b}", "📁");
-                let resp = label(ui, &icon, env.fg, true).on_hover_text("Open ChickenWM File Explorer (Super + E)");
+                let resp = label(ui, &icon, env.fg, true).hover_card("Open ChickenWM File Explorer (Super + E)");
                 if gestures(ui, env.css, widget, &resp).click {
                     spawn_sibling("chickenwm-files.exe");
                 }
             }
             Widget::Settings => {
                 let icon = self.icon("\u{f013}", "⚙");
-                let resp = label(ui, &icon, env.fg, true).on_hover_text("Open ChickenWM Settings (Super + I)");
+                let resp = label(ui, &icon, env.fg, true).hover_card("Open ChickenWM Settings (Super + I)");
                 if gestures(ui, env.css, widget, &resp).click {
                     spawn_sibling("chickenwm-settings.exe");
                 }
@@ -1178,7 +1182,7 @@ impl RooBarApp {
                 let fmt = widgets::css_string(env.css, "--clock-format")
                     .unwrap_or_else(|| widgets::DEFAULT_CLOCK_FORMAT.to_owned());
                 let text = format!("{} {}", self.icon("\u{f017}", "◷"), format_local_clock(&fmt));
-                let resp = label(ui, &text, env.fg, true).on_hover_text("Click for the calendar");
+                let resp = label(ui, &text, env.fg, true).hover_card("Click for the calendar");
                 if gestures(ui, env.css, widget, &resp).click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Calendar, resp.rect);
                 }
@@ -1191,7 +1195,7 @@ impl RooBarApp {
                     ui.ctx().animate_bool_with_time(id, power_resp.hovered() || self.power_overlay.is_some(), 0.15);
                 paint_island(ui.painter(), power_rect, env.style, hover_t);
                 paint_power_glyph(ui.painter(), power_rect.center(), island_h * 0.24, env.fg);
-                let power_resp = power_resp.on_hover_text("Shut down / Restart / Log out");
+                let power_resp = power_resp.hover_card("Shut down / Restart / Log out");
                 if gestures(ui, env.css, widget, &power_resp).click && self.power_overlay.is_none() {
                     // Snapshot the monitor now, before the overlay window covers it.
                     let backdrop = Backdrop::capture(ui.ctx(), self.screen_rect);
@@ -1205,7 +1209,7 @@ impl RooBarApp {
                 let hover_t = ui.ctx().animate_bool_with_time(id, resp.hovered() || menu_open, 0.15);
                 paint_island(ui.painter(), rect, env.style, hover_t);
                 paint_menu_glyph(ui.painter(), rect.center(), island_h * 0.24, env.fg);
-                let resp = resp.on_hover_text("File Explorer, Settings, About, Shut down");
+                let resp = resp.hover_card("File Explorer, Settings, About, Shut down");
                 if gestures(ui, env.css, widget, &resp).click {
                     if self.popover.as_ref().is_some_and(|p| p.kind == PopoverKind::About) {
                         if let Some(p) = self.popover.as_mut() {
@@ -1226,6 +1230,9 @@ impl eframe::App for RooBarApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.hover_cards.begin_frame();
+        let bar_outer = ctx.input(|i| i.viewport().outer_rect).unwrap_or(ctx.screen_rect());
+        hovercard::set_origin(bar_outer.min);
         if self.bar_hwnd.is_none() {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(h) = frame.window_handle() {
@@ -1384,7 +1391,7 @@ impl eframe::App for RooBarApp {
                             island_h,
                             true,
                         )
-                        .on_hover_text("Summon ChickenWM Launcher (Super + D)")
+                        .hover_card("Summon ChickenWM Launcher (Super + D)")
                         .clicked()
                         {
                             std::thread::spawn(|| {
@@ -1491,7 +1498,7 @@ impl eframe::App for RooBarApp {
                             let hover_title = info
                                 .and_then(|w| w.focused_title.as_deref())
                                 .unwrap_or("empty");
-                            let resp = resp.on_hover_text(format!(
+                            let resp = resp.hover_card(format!(
                                 "Workspace {} ({} window{}) — {}\nClick to switch • Scroll to cycle",
                                 ws_id,
                                 client_count,
@@ -1561,7 +1568,7 @@ impl eframe::App for RooBarApp {
                             island_h,
                             true,
                         )
-                        .on_hover_text("Click to toggle layout (Dwindle <-> Master)")
+                        .hover_card("Click to toggle layout (Dwindle <-> Master)")
                         .clicked()
                         {
                             let next = if is_master { "dwindle" } else { "master" };
@@ -1748,6 +1755,20 @@ impl eframe::App for RooBarApp {
                 }
             }
         }
+
+        // Hover cards (bar widgets, popover rows) in their own window so the bar doesn't clip
+        // them. Bar cards stay hidden while a popover is open or the power overlay is up.
+        self.hover_cards.show(
+            ctx,
+            self.screen_rect,
+            island_bg.to_opaque(),
+            border_color,
+            fg_color,
+            pill_radius,
+            egui::FontId::proportional((font_size - 1.0).max(9.0)),
+            self.power_overlay.is_some(),
+            self.popover.is_some().then_some(bar_outer),
+        );
 
         // Power overlay: a transparent full-monitor window that dims the screen and shows the
         // options as cards. Closes on Esc, a click on the dimmed area, or a pick (fade out first).
