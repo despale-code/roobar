@@ -27,8 +27,12 @@ use windows::Win32::NetworkManagement::WiFi::{
     WLAN_CONNECTION_ATTRIBUTES, WLAN_INTERFACE_INFO_LIST,
 };
 use windows::Win32::Networking::WinSock::AF_UNSPEC;
-use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED};
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::core::PCWSTR;
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED,
+};
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 const IF_TYPE_ETHERNET: u32 = 6;
@@ -256,10 +260,36 @@ fn query_notifications() -> Option<(u32, bool)> {
 }
 
 /// Opens a `ms-settings:` page (or any URI) through the shell, without needing Explorer running.
+///
+/// Runs on a thread of its own: `ShellExecute` runs the URI's COM handler and can take seconds
+/// (or wait on a shell that isn't there), and on the bar's UI thread that froze the whole bar.
 pub fn open_uri(uri: &str) {
-    unsafe {
-        ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(uri), None, None, SW_SHOWNORMAL);
-    }
+    let uri = uri.to_owned();
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let verb = HSTRING::from("open");
+        let file = HSTRING::from(uri.as_str());
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            // Finish the launch before this thread exits; no error dialogs from the shell.
+            fMask: SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+            lpVerb: PCWSTR(verb.as_ptr()),
+            lpFile: PCWSTR(file.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let result = ShellExecuteExW(&mut info);
+        let took = started.elapsed();
+        match result {
+            Err(e) => tracing::warn!("Opening {uri} failed: {e}"),
+            Ok(()) if took > Duration::from_secs(2) => {
+                tracing::warn!("Opening {uri} took {:.1} s", took.as_secs_f32())
+            }
+            Ok(()) => {}
+        }
+        CoUninitialize();
+    });
 }
 
 fn default_endpoint() -> Option<IAudioEndpointVolume> {
