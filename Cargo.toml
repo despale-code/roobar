@@ -1,6 +1,6 @@
 [package]
 name = "roobar"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["ChickenWM Contributors"]
 license = "MIT"
@@ -12,7 +12,7 @@ name = "roobar"
 path = "src/main.rs"
 
 [dependencies]
-chickenwm-core = { git = "https://github.com/despale-code/chickenwm-core", tag = "v0.1.2", features = ["egui", "headless"] }
+chickenwm-core = { git = "https://github.com/despale-code/chickenwm-core", tag = "v0.2.0", features = ["egui", "headless"] }
 anyhow = { version = "1.0" }
 tokio = { version = "1.43", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
