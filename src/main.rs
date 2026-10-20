@@ -15,6 +15,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Result;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use eframe::egui;
 use chickenwm_core::bootstrap_config_and_themes;
 use chickenwm_core::config::RgbaColor;
@@ -1385,10 +1386,11 @@ impl eframe::App for RooBarApp {
         let bar_outer = ctx.input(|i| i.viewport().outer_rect).unwrap_or(ctx.screen_rect());
         hovercard::set_origin(bar_outer.min);
         if self.bar_hwnd.is_none() {
-            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-            if let Ok(h) = frame.window_handle() {
+                        if let Ok(h) = frame.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
+                    let hwnd = windows::Win32::Foundation::HWND(w.hwnd.get() as *mut _);
                     self.bar_hwnd = Some(w.hwnd.get());
+                    chickenwm_core::sys::apply_acrylic(hwnd, None);
                 }
             }
         }
@@ -2289,7 +2291,15 @@ async fn main() -> Result<()> {
     let _ = eframe::run_native(
         "ChickenWM Bar — roobar",
         native_options,
-        Box::new(move |_cc| Ok(Box::new(RooBarApp::new(shared, screen_rect)))),
+        Box::new(move |cc| {
+            if let Ok(handle) = cc.window_handle() {
+                if let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
+                    let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
+                    chickenwm_core::sys::apply_acrylic(hwnd, None);
+                }
+            }
+            Ok(Box::new(RooBarApp::new(shared, screen_rect)))
+        }),
     );
 
     Ok(())
