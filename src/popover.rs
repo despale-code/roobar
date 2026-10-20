@@ -716,15 +716,33 @@ impl Popover {
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             let w = (ui.available_width() - 16.0) / 3.0;
-            let icon = |nerd: &'static str, plain: &'static str| if style.nerd { nerd } else { plain };
-            if ui.add_sized([w, 28.0], egui::Button::new(icon("\u{f04ae}", "|<"))).clicked() {
+            let draw_btn = |ui: &mut egui::Ui, painter_fn: fn(&egui::Painter, egui::Rect, egui::Color32)| -> egui::Response {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 28.0), egui::Sense::click());
+                let bg = if resp.is_pointer_button_down_on() {
+                    style.accent_bg.gamma_multiply(0.4)
+                } else if resp.hovered() {
+                    style.accent_bg.gamma_multiply(0.2)
+                } else {
+                    style.bg
+                };
+                ui.painter().rect_filled(rect, 4.0, bg);
+                ui.painter().rect_stroke(rect, 4.0, egui::Stroke::new(1.0_f32, style.border), egui::StrokeKind::Inside);
+                painter_fn(ui.painter(), rect, style.fg);
+                resp
+            };
+
+            if draw_btn(ui, chickenwm_core::ui_icons::paint_media_prev).clicked() {
                 out.cmds.push(Cmd::Previous);
             }
-            let play = if m.playing { icon("\u{f03e4}", "||") } else { icon("\u{f040a}", ">") };
-            if ui.add_sized([w, 28.0], egui::Button::new(play)).clicked() {
+            let play_fn = if m.playing {
+                chickenwm_core::ui_icons::paint_media_pause
+            } else {
+                chickenwm_core::ui_icons::paint_media_play
+            };
+            if draw_btn(ui, play_fn).clicked() {
                 out.cmds.push(Cmd::PlayPause);
             }
-            if ui.add_sized([w, 28.0], egui::Button::new(icon("\u{f04ad}", ">|"))).clicked() {
+            if draw_btn(ui, chickenwm_core::ui_icons::paint_media_next).clicked() {
                 out.cmds.push(Cmd::Next);
             }
         });

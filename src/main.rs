@@ -170,6 +170,7 @@ fn paint_hover_highlight(painter: &egui::Painter, rect: egui::Rect, style: &Isla
 }
 
 /// An island holding a single line of text. Clickable islands fade toward the hover colour.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn island_label(
     ui: &mut egui::Ui,
@@ -182,6 +183,25 @@ fn island_label(
     clickable: bool,
 ) -> egui::Response {
     pill_label(ui, id, style, text, font, color, height, clickable, false)
+}
+
+/// An island displaying an optional vector icon and optional text label.
+#[allow(clippy::too_many_arguments)]
+fn island_vector<F>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    style: &IslandStyle,
+    text: Option<&str>,
+    font: egui::FontId,
+    color: egui::Color32,
+    height: f32,
+    clickable: bool,
+    paint_icon: Option<F>,
+) -> egui::Response
+where
+    F: FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+{
+    pill_vector(ui, id, style, text, font, color, height, clickable, false, paint_icon)
 }
 
 /// `island_label`, or with `in_group` one segment of a shared pill: no island of its own, just a
@@ -198,10 +218,51 @@ fn pill_label(
     clickable: bool,
     in_group: bool,
 ) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, color);
+    pill_vector::<fn(&egui::Painter, egui::Rect, egui::Color32)>(
+        ui, id, style, Some(text), font, color, height, clickable, in_group, None,
+    )
+}
+
+/// An island or group segment displaying an optional vector icon and optional text label.
+#[allow(clippy::too_many_arguments)]
+fn pill_vector<F>(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    style: &IslandStyle,
+    text: Option<&str>,
+    font: egui::FontId,
+    color: egui::Color32,
+    height: f32,
+    clickable: bool,
+    in_group: bool,
+    paint_icon: Option<F>,
+) -> egui::Response
+where
+    F: FnOnce(&egui::Painter, egui::Rect, egui::Color32),
+{
     let bold_extra = if style.bold { 1.0 } else { 0.0 };
-    let padding = if in_group { 16.0 } else { 22.0 };
-    let size = egui::vec2(galley.size().x + bold_extra + padding, height);
+    let icon_w = if paint_icon.is_some() { 15.0_f32 } else { 0.0_f32 };
+    let has_text = text.map_or(false, |t| !t.is_empty());
+    let gap = if paint_icon.is_some() && has_text { 6.0_f32 } else { 0.0_f32 };
+
+    let (galley, text_w) = if let Some(t) = text.filter(|t| !t.is_empty()) {
+        let g = ui.painter().layout_no_wrap(t.to_owned(), font, color);
+        let w = g.size().x;
+        (Some(g), w)
+    } else {
+        (None, 0.0_f32)
+    };
+
+    let content_w = icon_w + gap + text_w + bold_extra;
+    let padding = if in_group {
+        if galley.is_none() { 12.0 } else { 16.0 }
+    } else if galley.is_none() {
+        height * 0.45
+    } else {
+        22.0
+    };
+    let width = (content_w + padding).max(if in_group { 18.0 } else { height + 4.0 });
+    let size = egui::vec2(width, height);
     let sense = if clickable {
         egui::Sense::click()
     } else {
@@ -216,8 +277,22 @@ fn pill_label(
     } else {
         paint_island(ui.painter(), rect, style, hover_t);
     }
-    let pos = rect.center() - (galley.size() + egui::vec2(bold_extra, 0.0)) / 2.0;
-    draw_text(ui.painter(), pos, galley, color, style.bold);
+
+    let start_x = rect.center().x - content_w / 2.0;
+    if let Some(painter_fn) = paint_icon {
+        let icon_rect = egui::Rect::from_center_size(
+            egui::pos2(start_x + icon_w / 2.0, rect.center().y),
+            egui::vec2(icon_w, icon_w),
+        );
+        painter_fn(ui.painter(), icon_rect, color);
+    }
+    if let Some(g) = galley {
+        let text_pos = egui::pos2(
+            start_x + icon_w + gap,
+            rect.center().y - g.size().y / 2.0,
+        );
+        draw_text(ui.painter(), text_pos, g, color, style.bold);
+    }
     resp
 }
 
@@ -716,6 +791,7 @@ impl RooBarApp {
     }
 
     /// Nerd Font glyph when available, otherwise a plain fallback symbol.
+    #[allow(dead_code)]
     fn icon(&self, nerd: &str, fallback: &str) -> String {
         if self.nerd_icons { nerd } else { fallback }.to_owned()
     }
@@ -783,19 +859,37 @@ impl RooBarApp {
     /// `in_group` draws it as a segment of a shared pill (`--modules-group`).
     fn draw_widget(&mut self, ui: &mut egui::Ui, widget: Widget, slot: usize, in_group: bool, env: &WidgetEnv) {
         let id = egui::Id::new(("widget", widget.name(), slot));
-        let label = |ui: &mut egui::Ui, text: &str, color: egui::Color32, clickable: bool| {
-            pill_label(ui, id, env.style, text, env.font.clone(), color, env.island_h, clickable, in_group)
-        };
         match widget {
             Widget::Stats => {
-                let text = format!(
-                    "{} {:>2.0}%  {} {:.1}G",
-                    self.icon("\u{f2db}", "cpu"),
-                    self.cpu_tracker.usage_pct,
-                    self.icon("\u{f233}", "ram"),
-                    self.mem_used_gb
-                );
-                let resp = label(ui, &text, env.fg, true).hover_card(format!(
+                let t1 = format!("{:>2.0}%", self.cpu_tracker.usage_pct);
+                let t2 = format!("{:.1}G", self.mem_used_gb);
+                let g1 = ui.painter().layout_no_wrap(t1, env.font.clone(), env.fg);
+                let g2 = ui.painter().layout_no_wrap(t2, env.font.clone(), env.fg);
+                let icon_w = 14.0_f32;
+                let gap = 5.0_f32;
+                let mid_gap = 10.0_f32;
+                let bold_extra = if env.style.bold { 1.0 } else { 0.0 };
+                let content_w = icon_w + gap + g1.size().x + mid_gap + icon_w + gap + g2.size().x + bold_extra * 2.0;
+                let padding = if in_group { 16.0 } else { 22.0 };
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(content_w + padding, env.island_h), egui::Sense::click());
+                let hover_t = ui.ctx().animate_bool_with_time(id, resp.hovered(), 0.15);
+                if in_group {
+                    paint_hover_highlight(ui.painter(), rect, env.style, hover_t);
+                } else {
+                    paint_island(ui.painter(), rect, env.style, hover_t);
+                }
+                let mut cur_x = rect.center().x - content_w / 2.0;
+                let icon1_r = egui::Rect::from_center_size(egui::pos2(cur_x + icon_w / 2.0, rect.center().y), egui::vec2(icon_w, icon_w));
+                chickenwm_core::ui_icons::paint_cpu(ui.painter(), icon1_r, env.fg);
+                cur_x += icon_w + gap;
+                let g1_w = g1.size().x;
+                draw_text(ui.painter(), egui::pos2(cur_x, rect.center().y - g1.size().y / 2.0), g1, env.fg, env.style.bold);
+                cur_x += g1_w + bold_extra + mid_gap;
+                let icon2_r = egui::Rect::from_center_size(egui::pos2(cur_x + icon_w / 2.0, rect.center().y), egui::vec2(icon_w, icon_w));
+                chickenwm_core::ui_icons::paint_memory(ui.painter(), icon2_r, env.fg);
+                cur_x += icon_w + gap;
+                draw_text(ui.painter(), egui::pos2(cur_x, rect.center().y - g2.size().y / 2.0), g2, env.fg, env.style.bold);
+                let resp = resp.hover_card(format!(
                     "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
                     self.mem_used_gb, self.mem_total_gb, self.mem_pct
                 ));
@@ -804,15 +898,21 @@ impl RooBarApp {
                 }
             }
             Widget::Cpu => {
-                let text = format!("{} {:>2.0}%", self.icon("\u{f2db}", "cpu"), self.cpu_tracker.usage_pct);
-                let resp = label(ui, &text, env.fg, true).hover_card("Click for top processes");
+                let text = format!("{:>2.0}%", self.cpu_tracker.usage_pct);
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), env.fg, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_cpu),
+                ).hover_card("Click for top processes");
                 if gestures(ui, env.css, widget, &resp).click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Processes, resp.rect);
                 }
             }
             Widget::Memory => {
-                let text = format!("{} {:.1}G", self.icon("\u{f233}", "ram"), self.mem_used_gb);
-                let resp = label(ui, &text, env.fg, true).hover_card(format!(
+                let text = format!("{:.1}G", self.mem_used_gb);
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), env.fg, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_memory),
+                ).hover_card(format!(
                     "RAM {:.1} / {:.1} GB ({}%)\nClick for top processes",
                     self.mem_used_gb, self.mem_total_gb, self.mem_pct
                 ));
@@ -822,18 +922,11 @@ impl RooBarApp {
             }
             Widget::Notifications => {
                 let s = self.status.snapshot();
-                let icon = if s.dnd {
-                    self.icon("\u{f009b}", "dnd")
-                } else if s.unread > 0 {
-                    self.icon("\u{f009e}", "!")
-                } else {
-                    self.icon("\u{f009a}", "bell")
-                };
                 let text = match (s.dnd, s.unread) {
-                    (true, 0) => format!("{icon} DND"),
-                    (true, n) => format!("{icon} DND ({n})"),
-                    (false, 0) => icon,
-                    (false, n) => format!("{icon} {n}"),
+                    (true, 0) => Some("DND".to_string()),
+                    (true, n) => Some(format!("DND ({n})")),
+                    (false, 0) => None,
+                    (false, n) => Some(format!("{n}")),
                 };
                 let color = if s.dnd || s.unread > 0 {
                     env.fg
@@ -845,7 +938,13 @@ impl RooBarApp {
                     (n, false) => format!("{n} new notification(s)"),
                     (n, true) => format!("Do not disturb is on ({n} new)"),
                 };
-                let resp = label(ui, &text, color, true).hover_card(format!("{hover}\nClick for the notification center (Super + N)"));
+                let dnd = s.dnd;
+                let resp = pill_vector(
+                    ui, id, env.style, text.as_deref(), env.font.clone(), color, env.island_h, true, in_group,
+                    Some(move |p: &egui::Painter, r: egui::Rect, c: egui::Color32| {
+                        chickenwm_core::ui_icons::paint_bell(p, r, c, dnd);
+                    }),
+                ).hover_card(format!("{hover}\nClick for the notification center (Super + N)"));
                 if gestures(ui, env.css, widget, &resp).click {
                     std::thread::spawn(|| {
                         let _ = send_ipc_command_blocking(chickenwm_core::ipc::PIPE_NAME_NOTIFY, &IpcCommand::ToggleNotificationCenter);
@@ -1021,7 +1120,7 @@ impl RooBarApp {
                 let Some(m) = self.status.snapshot().media else {
                     return;
                 };
-                let icon = if m.playing { self.icon("\u{f075a}", "♪") } else { self.icon("\u{f03e4}", "||") };
+                let is_playing = m.playing;
                 let mut text: String = if m.artist.is_empty() {
                     m.title.clone()
                 } else {
@@ -1031,9 +1130,17 @@ impl RooBarApp {
                 if text.chars().count() > max {
                     text = text.chars().take(max - 1).collect::<String>() + "…";
                 }
-                let color = if m.playing { env.fg } else { env.subtext };
-                let resp = label(ui, &format!("{icon} {text}"), color, true)
-                    .hover_card("Click for controls • Middle-click to play/pause");
+                let color = if is_playing { env.fg } else { env.subtext };
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), color, env.island_h, true, in_group,
+                    Some(move |p: &egui::Painter, r: egui::Rect, c: egui::Color32| {
+                        if is_playing {
+                            chickenwm_core::ui_icons::paint_media_play(p, r, c);
+                        } else {
+                            chickenwm_core::ui_icons::paint_media_pause(p, r, c);
+                        }
+                    }),
+                ).hover_card("Click for controls • Middle-click to play/pause");
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Media, resp.rect);
@@ -1043,18 +1150,21 @@ impl RooBarApp {
                 }
             }
             Widget::RefreshRate => {
-                let text = format!("{} {}Hz", self.icon("\u{f0e4}", "◔"), env.snap.monitor_refresh_hz);
-                label(ui, &text, env.subtext, false);
+                let text = format!("{}Hz", env.snap.monitor_refresh_hz);
+                pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), env.subtext, env.island_h, false, in_group,
+                    Some(chickenwm_core::ui_icons::paint_displays),
+                );
             }
             Widget::Network => {
                 let show_label = widgets::css_flag(env.css, "--network-label", false);
-                let (icon, name, hover, color) = match self.status.snapshot().network {
+                let net = self.status.snapshot().network;
+                let (name, hover, color) = match &net {
                     status::Network::Ethernet {
                         adapter,
                         speed_mbps,
                         ip,
                     } => (
-                        self.icon("\u{f0200}", "eth"),
                         "ethernet".to_owned(),
                         format!(
                             "Ethernet ({adapter})\nSpeed: {speed_mbps} Mbps • IP: {}",
@@ -1067,30 +1177,32 @@ impl RooBarApp {
                         signal,
                         speed_mbps,
                         ip,
-                    } => {
-                        let bars = match signal {
-                            0..=24 => "\u{f091f}",
-                            25..=49 => "\u{f0922}",
-                            50..=74 => "\u{f0925}",
-                            _ => "\u{f0928}",
-                        };
-                        let hover = format!(
+                    } => (
+                        ssid.clone(),
+                        format!(
                             "Wi-Fi: {} ({signal}%)\nSpeed: {speed_mbps} Mbps • IP: {}",
                             if ssid.is_empty() { "connected" } else { &ssid },
                             if ip.is_empty() { "—" } else { &ip }
-                        );
-                        (self.icon(bars, "wifi"), ssid, hover, env.fg)
-                    }
+                        ),
+                        env.fg,
+                    ),
                     status::Network::Disconnected => (
-                        self.icon("\u{f05aa}", "offline"),
                         "offline".to_owned(),
                         "Not connected".to_owned(),
                         env.subtext,
                     ),
                 };
-                let text = if show_label && !name.is_empty() { format!("{icon} {name}") } else { icon };
-                let resp = label(ui, &text, color, true)
-                    .hover_card(format!("{hover}\nClick for Wi-Fi networks • Right-click for network settings"));
+                let text = if show_label && !name.is_empty() { Some(name.as_str()) } else { None };
+                let resp = pill_vector(
+                    ui, id, env.style, text, env.font.clone(), color, env.island_h, true, in_group,
+                    Some(move |p: &egui::Painter, r: egui::Rect, c: egui::Color32| {
+                        match net {
+                            status::Network::Ethernet { .. } => chickenwm_core::ui_icons::paint_ethernet(p, r, c),
+                            status::Network::Wifi { signal, .. } => chickenwm_core::ui_icons::paint_wifi(p, r, c, signal as u8),
+                            status::Network::Disconnected => chickenwm_core::ui_icons::paint_wifi(p, r, c, 0),
+                        }
+                    }),
+                ).hover_card(format!("{hover}\nClick for Wi-Fi networks • Right-click for network settings"));
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Network, resp.rect);
@@ -1104,18 +1216,18 @@ impl RooBarApp {
                     return;
                 };
                 let pct = (vol.level * 100.0).round() as u32;
-                let (text, color) = if vol.muted {
-                    (format!("{} muted", self.icon("\u{f0581}", "mute")), env.subtext)
+                let muted = vol.muted;
+                let (text, color) = if muted {
+                    ("muted".to_owned(), env.subtext)
                 } else {
-                    let icon = match pct {
-                        0..=32 => self.icon("\u{f057f}", "vol"),
-                        33..=65 => self.icon("\u{f0580}", "vol"),
-                        _ => self.icon("\u{f057e}", "vol"),
-                    };
-                    (format!("{icon} {pct}%"), env.fg)
+                    (format!("{pct}%"), env.fg)
                 };
-                let resp = label(ui, &text, color, true)
-                    .hover_card("Click for volume and output • Middle-click to mute • Scroll to change • Right-click for sound settings");
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), color, env.island_h, true, in_group,
+                    Some(move |p: &egui::Painter, r: egui::Rect, c: egui::Color32| {
+                        chickenwm_core::ui_icons::paint_volume(p, r, c, muted, pct);
+                    }),
+                ).hover_card("Click for volume and output • Middle-click to mute • Scroll to change • Right-click for sound settings");
                 let g = gestures(ui, env.css, widget, &resp);
                 if g.click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Volume, resp.rect);
@@ -1138,25 +1250,27 @@ impl RooBarApp {
                 let (text, hover, color) = match self.status.snapshot().bluetooth {
                     status::Bluetooth::Unavailable => return,
                     status::Bluetooth::Off => {
-                        (self.icon("\u{f00b2}", "bt off"), "Bluetooth is off".to_owned(), env.subtext)
+                        (None, "Bluetooth is off".to_owned(), env.subtext)
                     }
                     status::Bluetooth::On { devices } if devices.is_empty() => {
-                        (self.icon("\u{f00af}", "bt"), "Bluetooth on, nothing connected".to_owned(), env.fg)
+                        (None, "Bluetooth on, nothing connected".to_owned(), env.fg)
                     }
                     status::Bluetooth::On { devices } => {
-                        let icon = self.icon("\u{f00b1}", "bt");
-                        let text = if !widgets::css_flag(env.css, "--bluetooth-label", false) {
-                            icon
+                        let label = if !widgets::css_flag(env.css, "--bluetooth-label", false) {
+                            None
                         } else if devices.len() == 1 {
                             let name: String = devices[0].chars().take(18).collect();
-                            format!("{icon} {name}")
+                            Some(name)
                         } else {
-                            format!("{icon} {}", devices.len())
+                            Some(format!("{}", devices.len()))
                         };
-                        (text, format!("Connected: {}", devices.join(", ")), env.fg)
+                        (label, format!("Connected: {}", devices.join(", ")), env.fg)
                     }
                 };
-                let resp = label(ui, &text, color, true).hover_card(format!("{hover}\nClick for Bluetooth settings"));
+                let resp = pill_vector(
+                    ui, id, env.style, text.as_deref(), env.font.clone(), color, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_bluetooth),
+                ).hover_card(format!("{hover}\nClick for Bluetooth settings"));
                 if gestures(ui, env.css, widget, &resp).click {
                     status::open_uri("ms-settings:bluetooth");
                 }
@@ -1166,25 +1280,16 @@ impl RooBarApp {
                     return; // Guard: Desktop PC or VM with no battery — completely omitted!
                 };
                 let pct = bat.percent;
-                let icon = if bat.charging {
-                    self.icon("\u{f0084}", "⚡")
-                } else {
-                    match pct {
-                        0..=15 => self.icon("\u{f007a}", "!"),
-                        16..=35 => self.icon("\u{f007b}", "bat"),
-                        36..=60 => self.icon("\u{f007c}", "bat"),
-                        61..=85 => self.icon("\u{f007d}", "bat"),
-                        _ => self.icon("\u{f0079}", "bat"),
-                    }
-                };
-                let (text, color) = if bat.charging {
-                    (format!("{icon} {pct}%"), env.fg)
+                let charging = bat.charging;
+                let text = format!("{pct}%");
+                let color = if charging {
+                    env.fg
                 } else if pct <= 15 {
-                    (format!("{icon} {pct}%"), egui::Color32::from_rgb(235, 95, 95))
+                    egui::Color32::from_rgb(235, 95, 95)
                 } else {
-                    (format!("{icon} {pct}%"), env.fg)
+                    env.fg
                 };
-                let tooltip = match (bat.charging, bat.remaining_seconds) {
+                let tooltip = match (charging, bat.remaining_seconds) {
                     (true, _) => format!("Battery: {pct}% (Charging)"),
                     (false, Some(sec)) => {
                         let mins = (sec / 60) % 60;
@@ -1193,21 +1298,30 @@ impl RooBarApp {
                     }
                     (false, None) => format!("Battery: {pct}%"),
                 };
-                let resp = label(ui, &text, color, true).hover_card(tooltip);
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), color, env.island_h, true, in_group,
+                    Some(move |p: &egui::Painter, r: egui::Rect, c: egui::Color32| {
+                        chickenwm_core::ui_icons::paint_battery(p, r, c, pct as u32, charging);
+                    }),
+                ).hover_card(tooltip);
                 if gestures(ui, env.css, widget, &resp).click {
                     status::open_uri("ms-settings:batterysaver");
                 }
             }
             Widget::Files => {
-                let icon = self.icon("\u{f07b}", "📁");
-                let resp = label(ui, &icon, env.fg, true).hover_card("Open ChickenWM File Explorer (Super + E)");
+                let resp = pill_vector(
+                    ui, id, env.style, None, env.font.clone(), env.fg, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_folder),
+                ).hover_card("Open ChickenWM File Explorer (Super + E)");
                 if gestures(ui, env.css, widget, &resp).click {
                     spawn_sibling("chickenwm-files.exe");
                 }
             }
             Widget::Settings => {
-                let icon = self.icon("\u{f013}", "⚙");
-                let resp = label(ui, &icon, env.fg, true).hover_card("Open ChickenWM Settings (Super + I)");
+                let resp = pill_vector(
+                    ui, id, env.style, None, env.font.clone(), env.fg, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_gear),
+                ).hover_card("Open ChickenWM Settings (Super + I)");
                 if gestures(ui, env.css, widget, &resp).click {
                     spawn_sibling("chickenwm-settings.exe");
                 }
@@ -1215,8 +1329,11 @@ impl RooBarApp {
             Widget::Clock => {
                 let fmt = widgets::css_string(env.css, "--clock-format")
                     .unwrap_or_else(|| widgets::DEFAULT_CLOCK_FORMAT.to_owned());
-                let text = format!("{} {}", self.icon("\u{f017}", "◷"), format_local_clock(&fmt));
-                let resp = label(ui, &text, env.fg, true).hover_card("Click for the calendar");
+                let text = format_local_clock(&fmt);
+                let resp = pill_vector(
+                    ui, id, env.style, Some(&text), env.font.clone(), env.fg, env.island_h, true, in_group,
+                    Some(chickenwm_core::ui_icons::paint_clock),
+                ).hover_card("Click for the calendar");
                 if gestures(ui, env.css, widget, &resp).click {
                     self.toggle_popover(ui.ctx(), PopoverKind::Calendar, resp.rect);
                 }
@@ -1440,16 +1557,16 @@ impl eframe::App for RooBarApp {
                     left_ui.horizontal_centered(|ui| {
                         ui.spacing_mut().item_spacing.x = island_gap;
 
-                        let launcher_text = format!("{} chickenwm", self.icon("\u{f17a}", "❖"));
-                        if island_label(
+                        if island_vector(
                             ui,
                             egui::Id::new("island-launcher"),
                             &style,
-                            &launcher_text,
+                            Some("chickenwm"),
                             font.clone(),
                             fg_color,
                             island_h,
                             true,
+                            Some(chickenwm_core::ui_icons::paint_launcher),
                         )
                         .hover_card("Summon ChickenWM Launcher (Super + D)")
                         .clicked()
@@ -1613,20 +1730,21 @@ impl eframe::App for RooBarApp {
                         }
 
                         let is_master = snap.active_layout.eq_ignore_ascii_case("master");
-                        let layout_text = if is_master {
-                            format!("{} master", self.icon("\u{f009}", "⊞"))
-                        } else {
-                            format!("{} dwindle", self.icon("\u{f0db}", "◫"))
-                        };
-                        if island_label(
+                        let layout_label = if is_master { "master" } else { "dwindle" };
+                        if island_vector(
                             ui,
                             egui::Id::new("island-layout"),
                             &style,
-                            &layout_text,
+                            Some(layout_label),
                             font.clone(),
                             accent_secondary,
                             island_h,
                             true,
+                            Some(if is_master {
+                                chickenwm_core::ui_icons::paint_layout_master
+                            } else {
+                                chickenwm_core::ui_icons::paint_layout_dwindle
+                            }),
                         )
                         .hover_card("Click to toggle layout (Dwindle <-> Master)")
                         .clicked()
@@ -1706,9 +1824,13 @@ impl eframe::App for RooBarApp {
                     );
                     if gap.width() >= 40.0 {
                         let ui = &mut center_ui;
-                        let text = format!("{}  {}", self.icon("\u{f2d0}", "▣"), title_text);
+                        let text = title_text;
                         let galley = ui.painter().layout_no_wrap(text, font.clone(), fg_color);
-                        let target_w = (galley.size().x + 24.0).min(ui.available_width());
+                        let icon_w = 14.0_f32;
+                        let gap_px = 6.0_f32;
+                        let bold_extra = if bold { 1.0 } else { 0.0 };
+                        let content_w = icon_w + gap_px + galley.size().x + bold_extra;
+                        let target_w = (content_w + 24.0).min(ui.available_width());
                         let width = ctx.animate_value_with_time(
                             egui::Id::new("island-title-w"),
                             target_w,
@@ -1719,8 +1841,14 @@ impl eframe::App for RooBarApp {
                             egui::Sense::hover(),
                         );
                         paint_island(ui.painter(), rect, &style, 0.0);
+                        let start_x = rect.center().x - content_w / 2.0;
+                        let icon_rect = egui::Rect::from_center_size(
+                            egui::pos2(start_x + icon_w / 2.0, rect.center().y),
+                            egui::vec2(icon_w, icon_w),
+                        );
+                        chickenwm_core::ui_icons::paint_window(ui.painter(), icon_rect, fg_color.gamma_multiply(title_fade));
                         let pos = egui::pos2(
-                            rect.center().x - galley.size().x / 2.0,
+                            start_x + icon_w + gap_px,
                             rect.center().y - galley.size().y / 2.0 + (1.0 - title_fade) * 4.0,
                         );
                         draw_text(
