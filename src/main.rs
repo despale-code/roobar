@@ -648,6 +648,7 @@ pub(crate) fn prepare_hwnd_no_transitions(hwnd: windows::Win32::Foundation::HWND
         if hwnd.0.is_null() {
             return;
         }
+        chickenwm_core::sys::suppress_nc_paint(hwnd);
         let disable = windows::Win32::Foundation::BOOL(1);
         let _ = DwmSetWindowAttribute(
             hwnd,

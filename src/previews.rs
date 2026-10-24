@@ -131,6 +131,7 @@ impl Preview {
             if hwnd.0.is_null() {
                 return;
             }
+            crate::prepare_hwnd_no_transitions(hwnd);
             self.dest = Some(hwnd.0 as isize);
             for c in &self.clients {
                 let src = HWND(c.hwnd as usize as *mut core::ffi::c_void);
