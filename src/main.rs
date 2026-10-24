@@ -638,16 +638,15 @@ impl Backdrop {
 
 const POWER_OVERLAY_TITLE: &str = "ChickenWM Power";
 
-/// Finds a window by title, disables its DWM open/close animation and returns whether it was found.
-pub(crate) fn prepare_window_no_transitions(title: &str) -> bool {
-    use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
-    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+pub(crate) fn prepare_hwnd_no_transitions(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE,
+        DWMWA_TRANSITIONS_FORCEDISABLED,
+    };
+    use windows::Win32::UI::Controls::MARGINS;
     unsafe {
-        let Ok(hwnd) = FindWindowW(None, &windows::core::HSTRING::from(title)) else {
-            return false;
-        };
         if hwnd.0.is_null() {
-            return false;
+            return;
         }
         let disable = windows::Win32::Foundation::BOOL(1);
         let _ = DwmSetWindowAttribute(
@@ -656,7 +655,7 @@ pub(crate) fn prepare_window_no_transitions(title: &str) -> bool {
             &disable as *const _ as *const core::ffi::c_void,
             size_of::<windows::Win32::Foundation::BOOL>() as u32,
         );
-        // No Windows 11 frame line or system rounding: the window draws its own card edge.
+        // No Windows 11 frame line, system rounding, or full-rect acrylic sheet over transparent areas.
         let no_border: u32 = 0xFFFF_FFFE; // DWMWA_COLOR_NONE
         let _ = DwmSetWindowAttribute(
             hwnd,
@@ -671,6 +670,34 @@ pub(crate) fn prepare_window_no_transitions(title: &str) -> bool {
             &no_round as *const _ as *const core::ffi::c_void,
             size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
+        let no_backdrop: u32 = 1; // DWMSBT_NONE
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            &no_backdrop as *const _ as *const core::ffi::c_void,
+            size_of::<u32>() as u32,
+        );
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
+}
+
+/// Finds a window by title, disables its DWM open/close animation and returns whether it was found.
+pub(crate) fn prepare_window_no_transitions(title: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::FindWindowW;
+    unsafe {
+        let Ok(hwnd) = FindWindowW(None, &windows::core::HSTRING::from(title)) else {
+            return false;
+        };
+        if hwnd.0.is_null() {
+            return false;
+        }
+        prepare_hwnd_no_transitions(hwnd);
         true
     }
 }
@@ -1386,11 +1413,11 @@ impl eframe::App for RooBarApp {
         let bar_outer = ctx.input(|i| i.viewport().outer_rect).unwrap_or(ctx.screen_rect());
         hovercard::set_origin(bar_outer.min);
         if self.bar_hwnd.is_none() {
-                        if let Ok(h) = frame.window_handle() {
+            if let Ok(h) = frame.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
                     let hwnd = windows::Win32::Foundation::HWND(w.hwnd.get() as *mut _);
                     self.bar_hwnd = Some(w.hwnd.get());
-                    chickenwm_core::sys::apply_acrylic(hwnd, None);
+                    prepare_hwnd_no_transitions(hwnd);
                 }
             }
         }
@@ -1526,8 +1553,6 @@ impl eframe::App for RooBarApp {
         let bar_frame = egui::Frame::NONE
             .fill(bar_bg)
             .stroke(if is_float && bar_bg.a() > 0 {
-                egui::Stroke::new(1.0_f32, border_color)
-            } else if !is_float && bar_bg.a() > 0 {
                 egui::Stroke::new(1.0_f32, border_color)
             } else {
                 egui::Stroke::NONE
@@ -1861,6 +1886,15 @@ impl eframe::App for RooBarApp {
                             bold,
                         );
                     }
+                }
+                if !is_float && bar_bg.a() > 0 {
+                    let panel_rect = ctx.screen_rect();
+                    let y = panel_rect.bottom() - 0.5;
+                    ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("roobar-bottom-border"),
+                    ))
+                    .hline(panel_rect.x_range(), y, egui::Stroke::new(1.0_f32, border_color));
                 }
             });
 
@@ -2295,7 +2329,7 @@ async fn main() -> Result<()> {
             if let Ok(handle) = cc.window_handle() {
                 if let raw_window_handle::RawWindowHandle::Win32(win32) = handle.as_raw() {
                     let hwnd = windows::Win32::Foundation::HWND(win32.hwnd.get() as *mut _);
-                    chickenwm_core::sys::apply_acrylic(hwnd, None);
+                    prepare_hwnd_no_transitions(hwnd);
                 }
             }
             Ok(Box::new(RooBarApp::new(shared, screen_rect)))
