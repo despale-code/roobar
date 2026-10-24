@@ -741,6 +741,8 @@ struct RooBarApp {
     popover_closed: Option<(PopoverKind, Instant)>,
     /// Tray icon textures by icon handle.
     tray_textures: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
+    /// Open window icon textures by HWND for workspace buttons.
+    window_icon_textures: std::collections::HashMap<u64, Option<egui::TextureHandle>>,
     /// User-defined tray icon order (`(hwnd, uid)`).
     tray_order: Vec<(u64, u32)>,
     /// User-hidden tray icons (`(hwnd, uid)`), shown dimmed only when the tray is expanded.
@@ -787,6 +789,7 @@ impl RooBarApp {
             popover_closed: None,
             last_float: None,
             tray_textures: Default::default(),
+            window_icon_textures: Default::default(),
             tray_order: Vec::new(),
             tray_hidden: Default::default(),
             tray_dragging: None,
@@ -1478,7 +1481,6 @@ impl eframe::App for RooBarApp {
         let ws_active_fg = col("--ws-active-fg", rgba(245, 236, 220, 255));
         let ws_occupied_bg = col("--ws-occupied-bg", rgba(59, 42, 31, 36));
         let ws_occupied_fg = col("--ws-occupied-fg", rgba(43, 29, 20, 255));
-        let ws_empty_bg = col("--ws-empty-bg", rgba(0, 0, 0, 0));
         let ws_empty_fg = col("--ws-empty-fg", rgba(43, 29, 20, 115));
         let border_color = col("--border-color", rgba(59, 42, 31, 70));
         let border_radius = css.var_px("--border-radius", 12.0);
@@ -1607,30 +1609,79 @@ impl eframe::App for RooBarApp {
                             });
                         }
 
-                        // #workspaces island with a sliding active highlight. Only workspaces
-                        // with windows (plus the active one) are shown; the rest collapse to
-                        // zero width and fade out, so the island grows/shrinks smoothly.
-                        let pill_h = (island_h - 8.0).max(14.0);
-                        let pill_gap = 3.0;
-                        let inner_pad = 4.0;
-                        // Sized from the font so two-digit labels ("10") always fit.
-                        let digit = font_size * 0.6;
-                        let active_w = digit * 2.0 + 28.0;
-                        let occupied_w = digit * 2.0 + 16.0;
+                        // #workspaces island: occupied workspaces show as pills with open program icons,
+                        // active empty workspace shows as a sleek pill, and inactive empty workspaces show as dots.
+                        let pill_h = (island_h - 10.0).clamp(16.0, 22.0);
+                        let pill_gap = 4.0;
+                        let inner_pad = 8.0;
+                        const MAX_WS_ICONS: usize = 6;
+                        let icon_size = (pill_h - 4.0).clamp(13.0, 16.0);
+                        let icon_gap = 4.0;
+                        let pill_pad_x = 8.0;
+                        let empty_active_w = (pill_h * 1.65).round();
+                        let empty_dot_w = 12.0;
+
+                        // Prune cached window icon textures to currently open windows and load new ones
+                        let mut live_hwnds = std::collections::HashSet::new();
+                        for ws in &snap.workspaces {
+                            for &h in &ws.client_hwnds {
+                                live_hwnds.insert(h);
+                                self.window_icon_textures.entry(h).or_insert_with(|| {
+                                    tray::window_icon_rgba(h).map(|(w, h_px, px)| {
+                                        ctx.load_texture(
+                                            format!("ws-win-{h}"),
+                                            egui::ColorImage::from_rgba_unmultiplied([w, h_px], &px),
+                                            egui::TextureOptions::LINEAR,
+                                        )
+                                    })
+                                });
+                            }
+                        }
+                        self.window_icon_textures.retain(|k, _| live_hwnds.contains(k));
+
+                        let highest_used = snap
+                            .workspaces
+                            .iter()
+                            .filter(|w| w.occupied || w.id == snap.active_workspace)
+                            .map(|w| w.id as usize)
+                            .max()
+                            .unwrap_or(1)
+                            .max(5);
+
                         let mut widths = [0.0_f32; 10];
                         let mut visibility = [0.0_f32; 10];
                         for idx in 0..10 {
                             let ws_id = (idx + 1) as u32;
-                            let occupied = snap.workspaces.get(idx).is_some_and(|w| w.occupied);
+                            let info = snap.workspaces.get(idx);
+                            let occupied = info.is_some_and(|w| w.occupied);
                             let active = snap.active_workspace == ws_id;
-                            let full = if active { active_w } else { occupied_w };
-                            let target = if active || occupied { full } else { 0.0 };
+                            let shown = (idx + 1) <= highest_used || active || occupied;
+                            let full = if occupied {
+                                let n = info
+                                    .map(|w| {
+                                        if !w.client_hwnds.is_empty() {
+                                            w.client_hwnds.len()
+                                        } else {
+                                            w.client_count
+                                        }
+                                    })
+                                    .unwrap_or(1)
+                                    .clamp(1, MAX_WS_ICONS);
+                                pill_pad_x * 2.0
+                                    + n as f32 * icon_size
+                                    + (n.saturating_sub(1)) as f32 * icon_gap
+                            } else if active {
+                                empty_active_w
+                            } else {
+                                empty_dot_w
+                            };
+                            let target = if shown { full } else { 0.0 };
                             widths[idx] = ctx.animate_value_with_time(
                                 egui::Id::new(("ws-width", idx)),
                                 target,
                                 anim_secs,
                             );
-                            visibility[idx] = (widths[idx] / full).clamp(0.0, 1.0);
+                            visibility[idx] = (widths[idx] / full.max(1.0)).clamp(0.0, 1.0);
                         }
                         let gaps: f32 = visibility.iter().map(|v| v * pill_gap).sum();
                         let total_w = widths.iter().sum::<f32>() + (gaps - pill_gap).max(0.0)
@@ -1650,7 +1701,7 @@ impl eframe::App for RooBarApp {
                             );
                             x += widths[idx] + pill_gap * visibility[idx];
                         }
-                        let pill_r = (pill_radius - 3.0).max(2.0);
+                        let pill_r = pill_h * 0.5;
                         let active_idx = (snap.active_workspace.clamp(1, 10) - 1) as usize;
                         let target = pills[active_idx];
                         let hl_x = ctx.animate_value_with_time(
@@ -1668,6 +1719,7 @@ impl eframe::App for RooBarApp {
                             egui::vec2(hl_w, pill_h),
                         );
 
+                        let mut hover_factors = [0.0_f32; 10];
                         for (idx, pill) in pills.iter().enumerate() {
                             if pill.width() < 1.0 {
                                 continue;
@@ -1689,14 +1741,16 @@ impl eframe::App for RooBarApp {
                                 resp.hovered() && !active,
                                 0.15,
                             );
-                            let base = if occupied { ws_occupied_bg } else { ws_empty_bg };
-                            ui.painter().rect_filled(*pill, pill_r, base);
-                            if hover_t > 0.0 {
-                                ui.painter().rect_filled(
-                                    *pill,
-                                    pill_r,
-                                    ws_active_bg.gamma_multiply(0.22 * hover_t),
-                                );
+                            hover_factors[idx] = hover_t;
+                            if occupied {
+                                ui.painter().rect_filled(*pill, pill_r, ws_occupied_bg);
+                                if hover_t > 0.0 {
+                                    ui.painter().rect_filled(
+                                        *pill,
+                                        pill_r,
+                                        ws_active_bg.gamma_multiply(0.22 * hover_t),
+                                    );
+                                }
                             }
 
                             let client_count = info.map(|w| w.client_count).unwrap_or(0);
@@ -1721,8 +1775,9 @@ impl eframe::App for RooBarApp {
                             if pill.width() < 1.0 {
                                 continue;
                             }
-                            let occupied = snap.workspaces.get(idx).is_some_and(|w| w.occupied);
-                            // Text flips to the highlight's colour while the highlight covers it.
+                            let info = snap.workspaces.get(idx);
+                            let occupied = info.is_some_and(|w| w.occupied);
+                            let active = idx == active_idx;
                             let covered = highlight.contains(pill.center());
                             let fg = if covered {
                                 ws_active_fg
@@ -1732,19 +1787,54 @@ impl eframe::App for RooBarApp {
                                 ws_empty_fg
                             }
                             .gamma_multiply(visibility[idx]);
-                            let number =
-                                ui.painter()
-                                    .layout_no_wrap(format!("{}", idx + 1), font.clone(), fg);
-                            // Whole-pixel position keeps the pixel font crisp; clip while the
-                            // pill is still growing or collapsing.
-                            let pos = (pill.center() - number.size() / 2.0).round();
-                            draw_text(&ui.painter_at(*pill), pos, number, fg, bold);
-                            if occupied && !covered {
-                                ui.painter().circle_filled(
-                                    egui::pos2(pill.center().x, pill.bottom() - 2.5),
-                                    1.5,
-                                    fg,
+
+                            if occupied {
+                                let hwnds = info.map(|w| w.client_hwnds.as_slice()).unwrap_or(&[]);
+                                let n = if !hwnds.is_empty() {
+                                    hwnds.len().min(MAX_WS_ICONS)
+                                } else {
+                                    info.map(|w| w.client_count).unwrap_or(1).clamp(1, MAX_WS_ICONS)
+                                };
+                                let row_w = n as f32 * icon_size
+                                    + (n.saturating_sub(1)) as f32 * icon_gap;
+                                let start_x = pill.center().x - row_w * 0.5;
+                                let clip_painter = ui.painter_at(*pill);
+                                let uv = egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
                                 );
+                                let tint = egui::Color32::from_white_alpha(
+                                    (255.0 * visibility[idx]).round() as u8,
+                                );
+                                for i in 0..n {
+                                    let cx = start_x
+                                        + icon_size * 0.5
+                                        + i as f32 * (icon_size + icon_gap);
+                                    let icon_rect = egui::Rect::from_center_size(
+                                        egui::pos2(cx, pill.center().y),
+                                        egui::vec2(icon_size, icon_size),
+                                    );
+                                    let tex = hwnds
+                                        .get(i)
+                                        .and_then(|h| self.window_icon_textures.get(h))
+                                        .and_then(|t| t.as_ref());
+                                    if let Some(t) = tex {
+                                        clip_painter.image(t.id(), icon_rect, uv, tint);
+                                    } else {
+                                        chickenwm_core::ui_icons::paint_window(
+                                            &clip_painter,
+                                            icon_rect.shrink(1.0),
+                                            fg,
+                                        );
+                                    }
+                                }
+                            } else if !active && !covered {
+                                let hover_t = hover_factors[idx];
+                                let dot_r = (3.0 + 1.2 * hover_t) * visibility[idx];
+                                let dot_col = ws_empty_fg
+                                    .lerp_to_gamma(fg_color, 0.55 * hover_t)
+                                    .gamma_multiply(visibility[idx]);
+                                ui.painter().circle_filled(pill.center(), dot_r, dot_col);
                             }
                         }
 

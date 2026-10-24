@@ -77,6 +77,94 @@ pub fn icon_rgba(icon: u64) -> Option<(usize, usize, Vec<u8>)> {
     }
 }
 
+/// Extracts RGBA icon pixels `(width, height, rgba)` for a top-level window `HWND`.
+/// Queries window/class `HICON` first, then falls back to extracting the owning process executable's shell icon.
+pub fn window_icon_rgba(hwnd_u64: u64) -> Option<(usize, usize, Vec<u8>)> {
+    use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DestroyIcon, GetClassLongPtrW, GetWindowThreadProcessId, IsWindow, SendMessageTimeoutW,
+        GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, SMTO_ABORTIFHUNG, WM_GETICON,
+    };
+
+    let hwnd = HWND(hwnd_u64 as usize as *mut core::ffi::c_void);
+    unsafe {
+        if hwnd.0.is_null() || !IsWindow(hwnd).as_bool() {
+            return None;
+        }
+
+        for icon_kind in [ICON_BIG as usize, 2usize, ICON_SMALL as usize] {
+            let mut h = 0usize;
+            if SendMessageTimeoutW(
+                hwnd,
+                WM_GETICON,
+                WPARAM(icon_kind),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                15,
+                Some(&mut h),
+            )
+            .0 != 0
+                && h != 0
+            {
+                if let Some(decoded) = icon_rgba(h as u64) {
+                    return Some(decoded);
+                }
+            }
+        }
+
+        for class_idx in [GCLP_HICON, GCLP_HICONSM] {
+            let h = GetClassLongPtrW(hwnd, class_idx);
+            if h != 0 {
+                if let Some(decoded) = icon_rgba(h as u64) {
+                    return Some(decoded);
+                }
+            }
+        }
+
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 {
+            if let Ok(proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let mut buf = [0u16; 1024];
+                let mut len = buf.len() as u32;
+                let ok = QueryFullProcessImageNameW(
+                    proc,
+                    PROCESS_NAME_FORMAT(0),
+                    PWSTR(buf.as_mut_ptr()),
+                    &mut len,
+                )
+                .is_ok();
+                let _ = CloseHandle(proc);
+                if ok && len > 0 {
+                    let mut shfi = SHFILEINFOW::default();
+                    let res = SHGetFileInfoW(
+                        PCWSTR(buf.as_ptr()),
+                        FILE_ATTRIBUTE_NORMAL,
+                        Some(&mut shfi),
+                        std::mem::size_of::<SHFILEINFOW>() as u32,
+                        SHGFI_ICON | SHGFI_LARGEICON,
+                    );
+                    if res != 0 && !shfi.hIcon.is_invalid() {
+                        let decoded = icon_rgba(shfi.hIcon.0 as usize as u64);
+                        let _ = DestroyIcon(shfi.hIcon);
+                        if decoded.is_some() {
+                            return decoded;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Click {
     Left,
